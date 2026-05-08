@@ -2,7 +2,7 @@
 
 A self-contained JS8 transceiver controller for amateur radio. Runs on a
 Raspberry Pi Zero 2W with a 240×240 SPI display, two GPIO buttons, and a
-USB keyboard. Drives any radio paired with a DigiRig (QDX, G90, etc.) —
+USB keyboard. Drives any radio paired with a QDX or DigiRig (G90, Baofeng etc) —
 RTS for PTT, USB audio for I/Q.
 
 JS8 is great for low-power messaging but JS8Call wants a full laptop.
@@ -15,7 +15,7 @@ shut down.
 | Component | Notes |
 |---|---|
 | SBC | Raspberry Pi Zero 2W (Bookworm 64-bit) |
-| Display | ST7789 240×240 SPI |
+| Display | Adafruit Mini PiTFT 1.3" 240×240 colour display mounted directly on the Pi's GPIO header |
 | Sound + PTT | DigiRig (USB audio + RTS keying) |
 | Radio | QDX (tested), G90, or any rig DigiRig speaks to |
 | GPS | gpsd-compatible (for grid + slot-time when chrony is unavailable) |
