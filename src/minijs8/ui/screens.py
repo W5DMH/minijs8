@@ -1,0 +1,1990 @@
+"""Screen renderers.
+
+Each renderer is a pure function: given a UI snapshot and a Fonts
+bundle, it returns a fully-painted 240x240 ``PIL.Image`` ready to be
+handed to the ST7789 driver. No global state, no I/O — that makes them
+trivially testable on the host.
+
+Layout convention (see ``theme.py``):
+
+    +--- HEADER (28px) ----+
+    |  TITLE          7/8  |    "7/8" = position-in-ring indicator
+    +----------------------+    (omitted on screens not in the ring)
+    |                      |
+    |        BODY          |
+    |                      |
+    +--- FOOTER (18px) ----+
+    |  hint text           |
+    +----------------------+
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from typing import Callable, Optional
+
+from PIL import Image, ImageDraw
+
+from minijs8 import __version__
+from minijs8.ui import theme
+from minijs8.ui.fonts import Fonts
+from minijs8.ui.state import (
+    ComposeCmd,
+    HB_MODES_ORDERED,
+    HbMode,
+    RING,
+    Screen,
+    UISnapshot,
+)
+
+_log = logging.getLogger(__name__)
+
+
+# ── Helpers ──────────────────────────────────────────────────────────
+
+
+def _new_canvas() -> tuple[Image.Image, ImageDraw.ImageDraw]:
+    """A fresh 240x240 RGB image with the body-background colour."""
+    img = Image.new("RGB", (theme.SCREEN_W, theme.SCREEN_H), theme.BG)
+    draw = ImageDraw.Draw(img)
+    return img, draw
+
+
+def _draw_header(
+    draw: ImageDraw.ImageDraw,
+    fonts: Fonts,
+    title: str,
+    state: UISnapshot,
+) -> None:
+    """Header banner: title left, ``UTC HH:MM:SS`` right.
+
+    Layout (28-px tall header):
+
+      ┌────────────────────────────────────────┐
+      │ TITLE                  UTC HH:MM:SS    │
+      └────────────────────────────────────────┘
+        ^left                  ^right-aligned
+        18 pt bold             14 pt bold
+
+    The ring-position indicator (N/M) was removed in this iteration —
+    it took space without telling the operator anything they couldn't
+    work out from "which screen am I currently on" + the footer hint.
+    Right-aligning the clock prevents collision with long titles like
+    "EMERGENCY" or "DIRECTED MENU"; centering looked elegant but
+    overlapped on titles wider than ~100 px.
+
+    Clock is rendered in HEADER_FG (white) regardless of time-source
+    state. The diagnostic ("is timing trusted?") lives on HOME's
+    TimeSrc row, which spells it out in plain language. Always-white
+    here means the operator never has to wonder why the header
+    looked dim.
+    """
+    draw.rectangle(
+        [(0, 0), (theme.SCREEN_W - 1, theme.HEADER_H - 1)],
+        fill=theme.HEADER_BG,
+    )
+    draw.line(
+        [(0, theme.HEADER_H), (theme.SCREEN_W - 1, theme.HEADER_H)],
+        fill=theme.SEPARATOR,
+    )
+
+    # Right column — measure the clock first so we know how much
+    # horizontal space the title has. "UTC HH:MM:SS" at 14 pt bold
+    # is ~118 px; the longest title ("DIRECTED MENU") is ~166 px so
+    # without truncation they'd overlap on a 240-px screen.
+    time_str = _format_time_for_header(state)
+    try:
+        time_w = int(draw.textlength(time_str, font=fonts.clock))
+        bbox = fonts.clock.getbbox("0")
+        time_h = bbox[3] - bbox[1]
+    except Exception:
+        time_w = 8 * len(time_str)
+        time_h = theme.FONT_CLOCK
+    time_x = theme.SCREEN_W - time_w - theme.PAD_X
+    time_y = (theme.HEADER_H - time_h) // 2 - 1  # -1 looks more anchored
+
+    # Title goes left, but must fit alongside the clock with at least
+    # a 6-px breathing gap. If the operator navigates to a screen
+    # whose title is too long, truncate with "…" — losing a few
+    # characters is better than overlap on hardware.
+    avail_title_w = time_x - theme.PAD_X - 6
+    truncated_title = title
+    try:
+        title_w = int(draw.textlength(truncated_title, font=fonts.title))
+        if title_w > avail_title_w:
+            ellipsis = "…"
+            i = len(truncated_title)
+            while i > 0:
+                candidate = truncated_title[:i] + ellipsis
+                try:
+                    cw = int(draw.textlength(candidate, font=fonts.title))
+                except Exception:
+                    cw = 10 * len(candidate)
+                if cw <= avail_title_w:
+                    truncated_title = candidate
+                    break
+                i -= 1
+            else:
+                truncated_title = ellipsis
+    except Exception:
+        # textlength unavailable — fall back to character-count guard.
+        # Worst case we render the full title and PIL clips at the
+        # canvas boundary; not pretty but not crash.
+        pass
+
+    draw.text(
+        (theme.PAD_X, theme.PAD_Y + 2),
+        truncated_title,
+        font=fonts.title,
+        fill=theme.HEADER_FG,
+    )
+
+    # Clock — right-aligned, vertically centered.
+    draw.text(
+        (time_x, time_y),
+        time_str,
+        font=fonts.clock,
+        fill=theme.HEADER_FG,
+    )
+
+
+def _format_time_for_header(state: UISnapshot) -> str:
+    """Return the ``UTC HH:MM:SS`` clock string for the header.
+
+    Source priority for the displayed time:
+
+      1. GPS fix (most authoritative when present — the GPS receiver's
+         own pulse-per-second is locked to the UTC second).
+      2. System clock as fallback. May be wildly wrong without any
+         time source — that's a separate diagnostic surfaced via
+         HOME's TimeSrc row, not via the clock display.
+
+    The "UTC " prefix is part of the string returned (not a separate
+    label) so the renderer measures + right-aligns it as a single
+    unit. On format failure (rare), we render ``UTC --:--:--`` as a
+    placeholder.
+    """
+    from datetime import datetime, timezone
+
+    if state.gps.fix_time is not None:
+        try:
+            ts = datetime.fromtimestamp(state.gps.fix_time, tz=timezone.utc)
+            return "UTC " + ts.strftime("%H:%M:%S")
+        except (ValueError, OSError, OverflowError):
+            return "UTC --:--:--"
+    try:
+        ts = datetime.fromtimestamp(time.time(), tz=timezone.utc)
+        return "UTC " + ts.strftime("%H:%M:%S")
+    except (ValueError, OSError, OverflowError):
+        return "UTC --:--:--"
+
+
+def _draw_footer(
+    draw: ImageDraw.ImageDraw, fonts: Fonts, hint: str
+) -> None:
+    """Single-line hint at the bottom of the screen."""
+    y0 = theme.SCREEN_H - theme.FOOTER_H
+    draw.rectangle(
+        [(0, y0), (theme.SCREEN_W - 1, theme.SCREEN_H - 1)],
+        fill=theme.FOOTER_BG,
+    )
+    draw.line(
+        [(0, y0 - 1), (theme.SCREEN_W - 1, y0 - 1)], fill=theme.SEPARATOR
+    )
+    draw.text(
+        (theme.PAD_X, y0 + 3), hint, font=fonts.small, fill=theme.FOOTER_FG
+    )
+
+
+def _kv_row(
+    draw: ImageDraw.ImageDraw,
+    fonts: Fonts,
+    y: int,
+    label: str,
+    value: str,
+    *,
+    value_color: tuple[int, int, int] = theme.FG,
+    label_w: int = 64,
+) -> None:
+    """Label on the left, value on the right of an x divider at label_w."""
+    draw.text((theme.PAD_X, y), label, font=fonts.body, fill=theme.FG_DIM)
+    draw.text(
+        (theme.PAD_X + label_w, y), value, font=fonts.body, fill=value_color
+    )
+
+
+# ── Per-screen renderers ─────────────────────────────────────────────
+
+
+def _render_home(state: UISnapshot, fonts: Fonts) -> Image.Image:
+    img, draw = _new_canvas()
+    _draw_header(draw, fonts, "HOME", state)
+
+    callsign_color = theme.FG if state.callsign != "N0CALL" else theme.FG_BAD
+    grid_display = state.grid if state.grid else "(unset)"
+    grid_color = theme.FG if state.grid else theme.FG_BAD
+    freq_mhz = state.freq_hz / 1_000_000.0
+
+    # GPS-derived fields
+    gps_label, gps_color = _gps_status_label(state)
+    # Time itself is now in the header banner on every screen — HOME
+    # keeps just the source tag so the operator can distinguish UTC
+    # (chrony-synced from GPS/NTP) from CONSENSUS (radio-derived
+    # median-dt fallback) from --- (no source, TX blocked). The
+    # header's color signals confidence at a glance; this row spells
+    # out which source is currently driving slot timing.
+    time_src_label, time_src_color = _time_source_label(state)
+
+    y = theme.BODY_Y0 + 6
+    _kv_row(draw, fonts, y, "Call", state.callsign, value_color=callsign_color)
+    y += 22
+    # Grid: show configured grid, with GPS-derived in parentheses if
+    # different (so the operator can see at a glance "I'm in a different
+    # grid than I told the radio").
+    grid_text = grid_display
+    if state.gps_grid and state.grid and state.gps_grid != state.grid:
+        grid_text = f"{grid_display} (gps {state.gps_grid})"
+    elif state.gps_grid and not state.grid:
+        # Configured grid is unset but GPS knows where we are
+        grid_text = f"(unset; gps {state.gps_grid})"
+    _kv_row(draw, fonts, y, "Grid", grid_text, value_color=grid_color)
+    y += 22
+    _kv_row(draw, fonts, y, "TimeSrc", time_src_label, value_color=time_src_color)
+    y += 22
+    _kv_row(draw, fonts, y, "GPS", gps_label, value_color=gps_color)
+    y += 22
+    _kv_row(draw, fonts, y, "Freq", f"{freq_mhz:.3f} MHz", value_color=theme.FG)
+    y += 22
+    # CAT status — green when rigctld is connected and we can transmit,
+    # dim "--" when not. Without CAT we can only receive.
+    cat_label = "CONNECTED" if state.cat_connected else "--"
+    cat_color = theme.FG_GOOD if state.cat_connected else theme.FG_DIM
+    _kv_row(draw, fonts, y, "CAT", cat_label, value_color=cat_color)
+    y += 22
+    _kv_row(draw, fonts, y, "Mode", f"JS8 {state.mode.upper()}", value_color=theme.FG)
+    y += 22
+    # HB row reads the live mode (spec §5.5). FG when active, FG_DIM
+    # when OFF — same dim-when-inactive convention as CAT above.
+    hb_label = state.hb_mode.value
+    hb_color = theme.FG if state.hb_mode is not HbMode.OFF else theme.FG_DIM
+    _kv_row(draw, fonts, y, "HB", hb_label, value_color=hb_color)
+
+    # Inbox indicator — only rendered when there's something to
+    # show, so the operator's eye is drawn to it. Format:
+    #   "Inbox  3 unread / 2 held"      (both non-zero)
+    #   "Inbox  3 unread"               (only unread)
+    #   "Inbox  2 held for others"      (only held)
+    # Held = STORE rows we're holding for someone else; unread =
+    # UNREAD rows addressed to us. The Phase 4 (Compose) work will
+    # add a "+ N delivering" segment once outbound mailbox tracking
+    # exists.
+    has_unread = state.inbox_unread_count > 0
+    has_held = state.inbox_held_count > 0
+    if has_unread or has_held:
+        y += 22
+        if has_unread and has_held:
+            label = (
+                f"{state.inbox_unread_count} unread "
+                f"/ {state.inbox_held_count} held"
+            )
+        elif has_unread:
+            label = f"{state.inbox_unread_count} unread"
+        else:
+            label = f"{state.inbox_held_count} held for others"
+        # Yellow when there are unread (calls operator's attention).
+        # Dim when only holding for others (no action required).
+        color = theme.FG_WARN if has_unread else theme.FG_DIM
+        _kv_row(draw, fonts, y, "Inbox", label, value_color=color)
+
+    if state.emergency_override:
+        if state.gps.has_position:
+            _draw_footer(draw, fonts, "EMERGENCY MODE — TX ARMED")
+        else:
+            _draw_footer(draw, fonts, "EMERGENCY MODE — awaiting GPS fix")
+    elif not state.tx_allowed:
+        _draw_footer(draw, fonts, "TX disabled — set callsign + grid in Setup")
+    else:
+        _draw_footer(draw, fonts, "← →  cycle screens")
+    return img
+
+
+def _gps_status_label(state: UISnapshot) -> tuple[str, tuple[int, int, int]]:
+    """Map GPS fix state to a short label + color for display.
+
+    Shows ``acquiring`` (amber) when the fix kind is 2D/3D but the
+    receiver hasn't produced a real position yet. This happens during
+    cold-start: gpsd asserts a mode-3 fix as soon as it has the time
+    + ephemeris pieces, but the actual coordinates take several more
+    seconds to compute. Without this distinction, HOME would
+    confidently say "3D fix (6 sat)" while EMERGENCY would show
+    "no position" — operator gets mixed signals about whether the
+    station is location-ready. The amber acquiring state signals
+    "fix declared, position pending" so both screens stay consistent.
+    """
+    from minijs8.gps.types import FixKind  # local to avoid cycle
+    kind = state.gps.kind
+    sats = state.gps.satellites_used
+    sat_suffix = f" ({sats} sat)" if sats is not None else ""
+    if kind == FixKind.FIX_3D:
+        if state.gps.has_position:
+            return f"3D fix{sat_suffix}", theme.FG_GOOD
+        return f"acquiring{sat_suffix}", theme.FG_WARN
+    if kind == FixKind.FIX_2D:
+        if state.gps.has_position:
+            return f"2D fix{sat_suffix}", theme.FG_WARN
+        return f"acquiring{sat_suffix}", theme.FG_WARN
+    if kind == FixKind.NO_FIX:
+        return "no fix" + sat_suffix, theme.FG_DIM
+    return "unknown", theme.FG_DIM
+
+
+def _time_source_label(state: UISnapshot) -> tuple[str, tuple[int, int, int]]:
+    """Return (label, color) for the HOME screen's TimeSrc row.
+
+    The header banner now shows the actual time on every screen — this
+    helper is just for the source tag, which the operator uses to
+    diagnose timing issues:
+
+      - "UTC" — chrony is synced (GPS-disciplined or NTP-peer); slot
+                timing is authoritative. TX allowed.
+      - "CONSENSUS" — chrony is unavailable but we have radio-derived
+                median-dt from observed decodes; slot timing is good
+                enough. TX allowed.
+      - "NONE" — neither chrony nor consensus is usable; slot
+                timing is unknown. TX is blocked. Color FG_DIM so
+                operator sees something is wrong at a glance.
+    """
+    src = state.time_source
+    if src == "consensus":
+        return "CONSENSUS", theme.FG
+    if src == "chrony":
+        return "UTC", theme.FG
+    return "NONE", theme.FG_DIM
+
+
+def _render_heard(state: UISnapshot, fonts: Fonts) -> Image.Image:
+    img, draw = _new_canvas()
+    _draw_header(draw, fonts, "HEARD", state)
+
+    # Column header row
+    cols = theme.HEARD_COL_X
+    headers = ("CALL", "SNR", "GRID", "MI", "AZ")
+    y = theme.BODY_Y0 + 2
+    for x, h in zip(cols, headers):
+        draw.text((x, y), h, font=fonts.small, fill=theme.FG_DIM)
+    y += 14
+    draw.line(
+        [(0, y), (theme.SCREEN_W - 1, y)], fill=theme.SEPARATOR
+    )
+    y += 4
+
+    # Render up to HEARD_ROWS_VISIBLE actual heard stations.
+    now = time.time()
+    rows = state.heard[: theme.HEARD_ROWS_VISIBLE]
+    if not rows:
+        draw.text(
+            (theme.PAD_X, y + 6),
+            "No stations heard yet.",
+            font=fonts.body, fill=theme.FG_DIM,
+        )
+        draw.text(
+            (theme.PAD_X, y + 28),
+            "Tune to 7.078 MHz USB",
+            font=fonts.small, fill=theme.FG_DIM,
+        )
+        draw.text(
+            (theme.PAD_X, y + 42),
+            "and wait for the next slot.",
+            font=fonts.small, fill=theme.FG_DIM,
+        )
+        _draw_footer(draw, fonts, "← →  cycle screens")
+        return img
+
+    for station in rows:
+        color = _age_color(now - station.last_heard)
+        # Render each column. Numbers right-justified for readability;
+        # callsign left-justified.
+        snr = f"{station.snr_db:+03d}" if station.snr_db is not None else " --"
+        grid = (station.grid or "----")[:4]
+        if station.distance_mi is not None:
+            d = int(round(station.distance_mi))
+            mi = f"{d:5d}"[:5]
+        else:
+            mi = "  ---"
+        if station.bearing_deg is not None:
+            az = f"{int(round(station.bearing_deg)):03d}"
+        else:
+            az = "---"
+        cells = (station.callsign[:8], snr, grid, mi.lstrip(), az)
+        for x, cell in zip(cols, cells):
+            draw.text((x, y), cell, font=fonts.body_mono, fill=color)
+        y += theme.HEARD_ROW_H
+        if y > theme.BODY_Y1 - theme.HEARD_ROW_H:
+            break
+
+    _draw_footer(draw, fonts, f"{len(state.heard)} heard · ← → cycle")
+    return img
+
+
+# Age thresholds for the "freshness" coloring (per Step 5 spec):
+#   <30 min  → green  (active)
+#   30 min–4 h → yellow (recent)
+#   >4 h    → gray   (stale)
+_AGE_GREEN_S = 30 * 60
+_AGE_YELLOW_S = 4 * 3600
+
+
+def _age_color(age_seconds: float) -> tuple[int, int, int]:
+    if age_seconds < _AGE_GREEN_S:
+        return theme.FG_GOOD
+    if age_seconds < _AGE_YELLOW_S:
+        return theme.FG_WARN
+    return theme.FG_DIM
+
+
+def _compose_field_color(
+    *,
+    value: str,
+    heard_index: Optional[int],
+    heard_list,
+    callsign: str,
+) -> tuple[int, int, int]:
+    """Pick a color for the COMPOSE TO or FOR field's value.
+
+    Three cases:
+      - Empty value → FG_DIM (placeholder).
+      - Picked from heard dropdown (heard_index is not None) →
+        HEARD-age colour for the matching row, so the operator sees
+        "is this contact fresh?" at a glance. We filter out self when
+        looking up the row, mirroring the dropdown's own filter.
+      - Typed free-form (value non-empty but heard_index is None) →
+        FG (plain white). Operator's own input gets neutral colour;
+        we don't pretend it's age-attested data.
+
+    Defensive against stale indices (heard list changed since the
+    operator picked); falls back to FG.
+    """
+    if not value:
+        return theme.FG_DIM
+    if heard_index is None:
+        return theme.FG
+    # Filter heard list the same way the dropdown does (self excluded).
+    our = (callsign or "").upper()
+    filtered = [
+        st for st in heard_list
+        if (st.callsign or "").upper() != our
+    ]
+    if 0 <= heard_index < len(filtered):
+        return _age_color(time.time() - filtered[heard_index].last_heard)
+    # Index out of range — heard list changed under us. Render in
+    # plain FG rather than crash.
+    return theme.FG
+
+
+def _render_directed(state: UISnapshot, fonts: Fonts) -> Image.Image:
+    """Render the directed-activity log (chat-style).
+
+    Shows the chronological back-and-forth of protocol-level directed
+    exchanges between our station and remote stations: SNR?, INFO,
+    GRID?, QUERY MSGS, QUERY MSG <id>, ACKs, etc. MSG / MSG TO:
+    content lives in the INBOX screen — this view is for the
+    surrounding protocol activity.
+
+    Layout per row:
+      ▸ KD8PGB QUERY MSGS               -10 dB     ← inbound (green ▸, SNR)
+      ◂ KD8PGB MSG 5                    12:35      ← outbound (white ◂, time)
+
+    Newest entry at the bottom (matches operator's natural reading
+    flow: read top-to-bottom and the most recent activity is what
+    they care about most).
+
+    Empty state: helpful message so first-boot operators know what
+    the screen is for.
+    """
+    img, draw = _new_canvas()
+    _draw_header(draw, fonts, "DIRECTED", state)
+
+    entries = state.directed_log_entries
+    if not entries:
+        y = theme.BODY_Y0 + 8
+        draw.text(
+            (theme.PAD_X, y),
+            "No directed protocol",
+            font=fonts.body, fill=theme.FG_DIM,
+        )
+        y += 22
+        draw.text(
+            (theme.PAD_X, y),
+            "activity yet.",
+            font=fonts.body, fill=theme.FG_DIM,
+        )
+        y += 28
+        draw.text(
+            (theme.PAD_X, y),
+            "SNR?, QUERY MSGS, ACKs",
+            font=fonts.small, fill=theme.FG_DIM,
+        )
+        y += 14
+        draw.text(
+            (theme.PAD_X, y),
+            "appear here.",
+            font=fonts.small, fill=theme.FG_DIM,
+        )
+        _draw_footer(draw, fonts, "← →  cycle screens")
+        return img
+
+    # ── List view ────────────────────────────────────────────────
+    #
+    # Newest at bottom. Bodies that don't fit on one line WRAP onto
+    # continuation lines indented under the body (not the chevron),
+    # so a long "HEARTBEAT SNR -09 MSG ID 1" or a free-text reply
+    # like "thanks for the heartbeat, how's propagation tonight?"
+    # stays fully readable. Operators treat this view as live chat,
+    # not just protocol summary, so we never ellipsize body content.
+    #
+    # Per-entry layout (single line):
+    #   ▸ KI4HDU HEARTBEAT SNR -9              -13 dB
+    #
+    # Per-entry layout (wrapped):
+    #   ▸ KD8GIJ thanks for the heartbeat,        -21 dB
+    #     how's propagation tonight?
+    #   ◂ K1ABC ACK                                12:35
+    row_h = 16
+    body_height = theme.BODY_Y1 - theme.BODY_Y0 - 8
+    max_total_rows = max(1, body_height // row_h)
+    arrow_x = theme.PAD_X
+    text_x = theme.PAD_X + 14
+    meta_x_right = theme.SCREEN_W - theme.PAD_X
+    # Width budget for the FIRST line of an entry (room for chevron
+    # on the left, meta column on the right). Continuation lines get
+    # the full body-text width since they have no meta column.
+    cont_text_w = meta_x_right - text_x
+
+    # Greedy word-wrap helper. Used per-entry: first call sizes for
+    # the first-line budget (which depends on the meta width), then
+    # subsequent calls (if any) use the continuation budget.
+    def _wrap_body(s: str, first_w: int, cont_w: int) -> list[str]:
+        s = (s or "").strip()
+        if not s:
+            return [""]
+        out: list[str] = []
+        words = s.split()
+        cur = ""
+        budget = first_w
+        for w in words:
+            candidate = w if not cur else (cur + " " + w)
+            try:
+                px = int(draw.textlength(candidate, font=fonts.small))
+            except Exception:
+                px = 6 * len(candidate)
+            if px <= budget:
+                cur = candidate
+                continue
+            # Word doesn't fit on the current line.
+            if cur:
+                out.append(cur)
+                cur = ""
+                budget = cont_w
+                # Retry: does the word fit on a fresh line?
+                try:
+                    pw = int(draw.textlength(w, font=fonts.small))
+                except Exception:
+                    pw = 6 * len(w)
+                if pw <= budget:
+                    cur = w
+                    continue
+            # Single word longer than the line: break on chars.
+            remainder = w
+            while remainder:
+                # Find the longest prefix that fits.
+                lo, hi = 1, len(remainder)
+                fit = 1
+                while lo <= hi:
+                    mid = (lo + hi) // 2
+                    try:
+                        wm = int(draw.textlength(
+                            remainder[:mid], font=fonts.small
+                        ))
+                    except Exception:
+                        wm = 6 * mid
+                    if wm <= budget:
+                        fit = mid
+                        lo = mid + 1
+                    else:
+                        hi = mid - 1
+                out.append(remainder[:fit])
+                remainder = remainder[fit:]
+                budget = cont_w
+        if cur:
+            out.append(cur)
+        return out or [""]
+
+    # Pass 1: build per-entry wrapped-line lists, newest first, until
+    # we've accumulated enough lines to fill the screen. Each entry's
+    # first-line budget depends on its meta width (right-aligned SNR
+    # or time stamp), so we compute meta + first-line budget per
+    # entry before wrapping.
+    rendered: list[tuple] = []   # (entry, lines, meta, meta_w, is_in)
+    rows_consumed = 0
+    for entry in reversed(entries):
+        is_in = (entry.direction.value == "IN")
+        if is_in and entry.snr_db is not None:
+            meta = f"{entry.snr_db:+d} dB"
+        elif not is_in:
+            meta = _format_unix_hhmm(entry.at_unix)
+        else:
+            meta = ""
+        try:
+            meta_w = int(draw.textlength(meta, font=fonts.small)) if meta else 0
+        except Exception:
+            meta_w = 6 * len(meta)
+        # First-line budget: text_x → meta_left, with a 4-px gap.
+        first_w = (meta_x_right - meta_w - 4) - text_x
+        if first_w < 30:
+            first_w = 30
+        # Compose the body string. "CALL VERB body" with body
+        # possibly empty (e.g. ACK with no body). When the entry was
+        # addressed to a JS8Call group we belong to (rather than to
+        # us personally), tag the sender with the group affiliation
+        # so the operator distinguishes a group blast from personal
+        # traffic at a glance. The K1ABC@@ARESGA double-'@' form
+        # reads cleanly: "K1ABC speaking to the @ARESGA group". The
+        # group tag is part of the sender label, not a separate
+        # token, so word-wrap keeps it adjacent.
+        sender = entry.other_call
+        if entry.for_group:
+            sender = f"{sender}@{entry.for_group}"
+        if entry.body:
+            full = f"{sender} {entry.verb} {entry.body}"
+        else:
+            full = f"{sender} {entry.verb}"
+        lines = _wrap_body(full, first_w, cont_text_w)
+        # Cap the wrap at the screen height so one runaway entry
+        # can't dominate; truncate with ellipsis on the last line
+        # when capped.
+        if rows_consumed + len(lines) > max_total_rows:
+            keep = max_total_rows - rows_consumed
+            if keep <= 0:
+                break
+            if keep < len(lines):
+                # Mark the last visible line with an ellipsis so the
+                # operator sees that content was cut.
+                lines = lines[:keep]
+                if lines:
+                    last = lines[-1]
+                    ellipsis = "…"
+                    # Trim to make room for the ellipsis.
+                    while last and True:
+                        try:
+                            w_last = int(draw.textlength(
+                                last + ellipsis, font=fonts.small
+                            ))
+                        except Exception:
+                            w_last = 6 * (len(last) + 1)
+                        budget = first_w if len(lines) == 1 else cont_text_w
+                        if w_last <= budget:
+                            break
+                        last = last[:-1]
+                    lines[-1] = (last + ellipsis) if last else ellipsis
+        rendered.append((entry, lines, meta, meta_w, is_in))
+        rows_consumed += len(lines)
+        if rows_consumed >= max_total_rows:
+            break
+
+    # Pass 2: render top-to-bottom in NEWEST-FIRST order. Operator
+    # wanted newest at the top of the body region, pushing older
+    # entries downward (news-feed style, not chat-style). Pass 1
+    # built ``rendered`` newest-first by iterating ``reversed(entries)``
+    # so we render directly without re-reversing.
+    y = theme.BODY_Y0 + 6
+
+    for entry, lines, meta, meta_w, is_in in rendered:
+        # First line: chevron + body + meta.
+        arrow = "▸" if is_in else "◂"
+        arrow_color = theme.FG_GOOD if is_in else theme.FG
+        draw.text((arrow_x, y), arrow, font=fonts.body, fill=arrow_color)
+        body_fill = theme.FG if is_in else theme.FG_BAD
+        draw.text((text_x, y), lines[0], font=fonts.small, fill=body_fill)
+        if meta:
+            draw.text(
+                (meta_x_right - meta_w, y),
+                meta, font=fonts.small, fill=theme.FG_DIM,
+            )
+        y += row_h
+        # Continuation lines: indent at text_x, no chevron, no meta.
+        for cont_line in lines[1:]:
+            draw.text(
+                (text_x, y), cont_line,
+                font=fonts.small, fill=body_fill,
+            )
+            y += row_h
+        if y > theme.BODY_Y1 - 2:
+            break
+
+    # Footer hint: count + nav. Total reflects what's IN THE LOG, not
+    # just what fits on screen — operators want to know if the buffer
+    # is filling up.
+    n_total = len(entries)
+    if n_total >= 200:  # bumping near cap
+        footer = f"{n_total} entries (cap) · ← →"
+    else:
+        footer = f"{n_total} entries · ← →"
+    _draw_footer(draw, fonts, footer)
+    return img
+
+
+def _format_unix_hhmm(at_unix: float) -> str:
+    """Format a Unix timestamp as ``HH:MM`` in UTC.
+
+    UTC is the right choice here because it matches the timestamps
+    JS8Call uses everywhere (slot boundaries are UTC). Local-time
+    formatting would require knowing the operator's timezone, which
+    on a Pi without RTC is often wrong until NTP syncs.
+
+    Failures (negative, NaN, far-future) silently fall back to
+    "--:--" so a corrupt entry doesn't break the rest of the list.
+    """
+    try:
+        import time as _time
+        gm = _time.gmtime(at_unix)
+        return f"{gm.tm_hour:02d}:{gm.tm_min:02d}"
+    except Exception:
+        return "--:--"
+
+
+def _render_inbox(state: UISnapshot, fonts: Fonts) -> Image.Image:
+    """Render the inbox / mailbox screen.
+
+    List view of UNREAD + READ rows from inbox_messages, newest first.
+    Focus chevron on the focused row, bold for UNREAD (calls
+    attention), dim for READ. Enter on focused → detail view (handled
+    by router; this renderer just shows the focus state).
+
+    Empty state: a friendly help message so first-boot operators know
+    what the screen is for.
+    """
+    img, draw = _new_canvas()
+    _draw_header(draw, fonts, "INBOX", state)
+
+    if not state.inbox_messages:
+        y = theme.BODY_Y0 + 8
+        draw.text(
+            (theme.PAD_X, y),
+            "No messages addressed",
+            font=fonts.body, fill=theme.FG_DIM,
+        )
+        y += 22
+        draw.text(
+            (theme.PAD_X, y),
+            f"to {state.callsign} yet.",
+            font=fonts.body, fill=theme.FG_DIM,
+        )
+        y += 28
+        draw.text(
+            (theme.PAD_X, y),
+            "Inbound MSG arrives here",
+            font=fonts.small, fill=theme.FG_DIM,
+        )
+        y += 14
+        draw.text(
+            (theme.PAD_X, y),
+            "automatically.",
+            font=fonts.small, fill=theme.FG_DIM,
+        )
+        if state.inbox_held_count:
+            y += 22
+            draw.text(
+                (theme.PAD_X, y),
+                f"({state.inbox_held_count} held for others)",
+                font=fonts.small, fill=theme.FG_DIM,
+            )
+        _draw_footer(draw, fonts, "← →  cycle screens")
+        return img
+
+    # ── List view ────────────────────────────────────────────────
+    #
+    # Each row takes ~32px (header line + body line). At 240px tall
+    # body region we can show ~6 rows. A focused row gets a chevron
+    # at the leading edge AND a slightly different color (theme.FG
+    # rather than theme.FG_DIM) so the operator knows what Enter
+    # will open. Unread rows are white (theme.FG); read rows are
+    # dim (theme.FG_DIM).
+    y = theme.BODY_Y0 + 4
+    visible_rows = state.inbox_messages[:6]
+    focused = state.inbox_focused_index
+    chev_x = theme.PAD_X
+    text_x = theme.PAD_X + 12  # leave room for the chevron
+
+    for i, row in enumerate(visible_rows):
+        is_focused = (i == focused)
+
+        # Row colour:
+        #   UNREAD inbox        → theme.FG (white, attention-grabbing)
+        #   READ inbox          → theme.FG_DIM (recedes)
+        #   STORE (held mail)   → theme.FG_WARN (amber) — visually
+        #                         distinct from inbound mail so the
+        #                         operator sees at a glance "this is
+        #                         outbound held mail, not someone
+        #                         talking to me". Focus highlight
+        #                         still applies on top.
+        if row.is_stored:
+            color = theme.FG_WARN
+        elif row.is_read:
+            color = theme.FG_DIM
+        else:
+            color = theme.FG
+
+        # Focused row gets a chevron and a slight emphasis upgrade
+        # if it's already FG_DIM (so READ messages still highlight
+        # when focused). For UNREAD, the chevron alone is enough —
+        # the row is already at full intensity. STORE rows keep
+        # their amber color when focused — bumping them to white
+        # would look like the type changed.
+        if is_focused:
+            draw.text((chev_x, y), "▸", font=fonts.body, fill=theme.FG_GOOD)
+            if not row.is_stored and row.is_read:
+                color = theme.FG  # promote to full white when focused
+
+        # Header line.
+        #   Inbox rows: "FROM_CALL  -SNR  HH:MM"
+        #   STORE rows: "→RECIPIENT  -   HH:MM"  (no SNR — STORE has no
+        #               wire reception; the arrow signals "we're
+        #               holding this FOR somebody")
+        snr_text = f"{row.snr_db:+03d}" if row.snr_db is not None else " . "
+        ts = _format_inbox_time(row.utc_iso)
+        if row.is_stored:
+            target = row.recipient or "?"
+            # 9 chars total ("→" + 8 cap callsign) keeps alignment
+            # with the inbox FROM column width.
+            label = f"→{target:<7s}"
+            hdr = f"{label} {snr_text}  {ts}"
+        else:
+            hdr = f"{row.from_call:<8s} {snr_text}  {ts}"
+        draw.text((text_x, y), hdr, font=fonts.body_mono, fill=color)
+        y += 14
+
+        # Body — single-line preview, truncated with ellipsis
+        body = row.body
+        max_chars = 28
+        wrapped = body if len(body) <= max_chars else body[: max_chars - 1] + "…"
+        draw.text((text_x + 4, y), wrapped, font=fonts.small, fill=color)
+        y += 18
+        if y > theme.BODY_Y1 - 16:
+            break
+
+    # Footer: split the totals so the operator can see how many of
+    # each kind they're looking at. UNREAD count dominates messaging
+    # but the held-STORE count tells them what's eating their disk +
+    # what will be served when peers QUERY MSGS.
+    n_total = len(state.inbox_messages)
+    n_unread = state.inbox_unread_count
+    n_stored = sum(1 for r in state.inbox_messages if r.is_stored)
+    parts: list[str] = []
+    if n_unread > 0:
+        parts.append(f"{n_unread} unread")
+    inbox_count = n_total - n_stored
+    parts.append(f"{inbox_count} inbox")
+    if n_stored:
+        parts.append(f"{n_stored} stored")
+    footer = " · ".join(parts) + "  Enter open · Del delete"
+    _draw_footer(draw, fonts, footer)
+    return img
+
+
+def _format_inbox_time(utc_iso: str) -> str:
+    """Render an ISO-8601 timestamp as ``HH:MM`` for the inbox list.
+
+    Failures (empty or malformed) silently fall back to "--:--" so a
+    bad row doesn't break the rest of the list rendering.
+    """
+    if not utc_iso:
+        return "--:--"
+    try:
+        # ISO 8601 from MailboxStore looks like "2026-05-06T14:23:11.000+00:00".
+        # Pull H:M directly from positions 11-16 to avoid the cost of
+        # full datetime.fromisoformat() on every render.
+        if len(utc_iso) >= 16 and utc_iso[10] in ("T", " "):
+            return utc_iso[11:16]
+    except Exception:
+        pass
+    return "--:--"
+
+
+def _render_inbox_detail(state: UISnapshot, fonts: Fonts) -> Image.Image:
+    """Full-screen detail view of one inbox message.
+
+    Entered via Enter on a focused row in the inbox list. The header
+    shows from-call + timestamp + SNR; the body wraps to fit the
+    panel width. Esc returns to the list (handled in router).
+
+    If the detail-id doesn't match any current row (race: the row
+    was deleted while we were viewing), we degrade to a friendly
+    "(message no longer available)" message rather than crashing.
+    """
+    img, draw = _new_canvas()
+    # Header label flips for STORE rows: "MESSAGE" describes
+    # received mail; "STORED" describes mail we're holding to deliver.
+    # Header line uses the FG_WARN color in the title bar to echo the
+    # amber list-row treatment, so the operator's eye recognizes the
+    # context instantly.
+    is_stored_view = False
+    target_id = state.inbox_detail_id
+    if target_id is not None:
+        for row in state.inbox_messages:
+            if row.id == target_id and row.is_stored:
+                is_stored_view = True
+                break
+    _draw_header(
+        draw, fonts,
+        "STORED" if is_stored_view else "MESSAGE",
+        state,
+    )
+
+    target_row = None
+    if target_id is not None:
+        for row in state.inbox_messages:
+            if row.id == target_id:
+                target_row = row
+                break
+
+    if target_row is None:
+        y = theme.BODY_Y0 + 16
+        draw.text(
+            (theme.PAD_X, y),
+            "(message no longer",
+            font=fonts.body, fill=theme.FG_DIM,
+        )
+        y += 22
+        draw.text(
+            (theme.PAD_X, y),
+            "available)",
+            font=fonts.body, fill=theme.FG_DIM,
+        )
+        _draw_footer(draw, fonts, "Esc  return")
+        return img
+
+    # ── Header section ───────────────────────────────────────────
+    #
+    # Inbound rows (UNREAD / READ):
+    #   From:  K1ABC
+    #   At:    2026-05-06 14:23 UTC
+    #   SNR:   -3 dB
+    #
+    # Held STORE rows (we're holding mail FOR someone):
+    #   For:   KD8PGB
+    #   By:    W5DMH               ← who originated; usually us
+    #   Stored: 2026-05-06 14:23 UTC
+    #
+    # SNR is omitted for STORE rows: there's no reception, no SNR.
+    y = theme.BODY_Y0 + 4
+    if target_row.is_stored:
+        _kv_row(
+            draw, fonts, y, "For",
+            target_row.recipient or "?",
+            value_color=theme.FG_WARN, label_w=60,
+        )
+        y += 22
+        # Show originator only when it's NOT us — when we stored it
+        # ourselves via Compose-STORE the "By:" row is just our
+        # own callsign and adds no information. For relay STOREs
+        # (MSG TO: stored on our behalf from a third party) the
+        # FROM_call is the third-party station and it's useful to
+        # see who originated.
+        our_call = state.callsign
+        if (
+            target_row.from_call
+            and target_row.from_call.upper() != (our_call or "").upper()
+        ):
+            _kv_row(
+                draw, fonts, y, "By",
+                target_row.from_call,
+                value_color=theme.FG, label_w=60,
+            )
+            y += 22
+        _kv_row(
+            draw, fonts, y, "Stored",
+            _format_inbox_full_time(target_row.utc_iso),
+            value_color=theme.FG, label_w=60,
+        )
+        y += 22
+    else:
+        _kv_row(
+            draw, fonts, y, "From",
+            target_row.from_call or "?",
+            value_color=theme.FG, label_w=44,
+        )
+        y += 22
+        _kv_row(
+            draw, fonts, y, "At",
+            _format_inbox_full_time(target_row.utc_iso),
+            value_color=theme.FG, label_w=44,
+        )
+        y += 22
+        if target_row.snr_db is not None:
+            _kv_row(
+                draw, fonts, y, "SNR",
+                f"{target_row.snr_db:+d} dB",
+                value_color=theme.FG, label_w=44,
+            )
+            y += 22
+    # Spacer line.
+    y += 6
+
+    # ── Body section ─────────────────────────────────────────────
+    # Wrap the body to the panel width, leaving the footer reserved.
+    # Word-wrap if possible; if a single token is longer than the
+    # max line, hard-wrap it. ~32 monospace characters fits the
+    # 240px wide body region with body_mono font.
+    body_text = target_row.body or "(empty body)"
+    lines = _wrap_message_body(body_text, max_chars=32)
+    # Body color: amber for STORE rows to echo the row treatment,
+    # white for inbox rows.
+    body_color = theme.FG_WARN if target_row.is_stored else theme.FG
+    body_y = y
+    max_y = theme.BODY_Y1 - 16
+    truncated = False
+    for line in lines:
+        if body_y + 16 > max_y:
+            truncated = True
+            break
+        draw.text(
+            (theme.PAD_X, body_y), line,
+            font=fonts.body_mono, fill=body_color,
+        )
+        body_y += 16
+    if truncated:
+        draw.text(
+            (theme.PAD_X, max_y - 14), "… (more)",
+            font=fonts.small, fill=theme.FG_DIM,
+        )
+
+    # Footer text differs slightly — STORE rows can only be deleted
+    # (no "mark read" semantics for held mail).
+    if target_row.is_stored:
+        _draw_footer(draw, fonts, "Esc back · Del delete held mail")
+    else:
+        _draw_footer(draw, fonts, "Esc  return")
+    return img
+
+
+def _format_inbox_full_time(utc_iso: str) -> str:
+    """Render ISO timestamp as 'YYYY-MM-DD HH:MM UTC' for the detail view.
+
+    Falls back to the raw string on parse failure rather than ?''s,
+    so the operator at least sees the data.
+    """
+    if not utc_iso:
+        return "(unknown)"
+    if len(utc_iso) >= 16 and utc_iso[10] in ("T", " "):
+        return f"{utc_iso[:10]} {utc_iso[11:16]} UTC"
+    return utc_iso
+
+
+def _wrap_message_body(text: str, max_chars: int) -> list[str]:
+    """Word-wrap ``text`` to lines no longer than ``max_chars`` chars.
+
+    Prefers word boundaries; if a single word is longer than max_chars
+    it gets hard-broken. Result is suitable for the detail-view body
+    region.
+    """
+    out: list[str] = []
+    for paragraph in text.split("\n"):
+        if not paragraph:
+            out.append("")
+            continue
+        line = ""
+        for word in paragraph.split(" "):
+            if not word:
+                continue
+            # Hard-break a too-long word.
+            while len(word) > max_chars:
+                if line:
+                    out.append(line)
+                    line = ""
+                out.append(word[:max_chars])
+                word = word[max_chars:]
+            candidate = (line + " " + word).strip() if line else word
+            if len(candidate) <= max_chars:
+                line = candidate
+            else:
+                if line:
+                    out.append(line)
+                line = word
+        if line:
+            out.append(line)
+    return out
+
+
+def _render_compose(state: UISnapshot, fonts: Fonts) -> Image.Image:
+    """COMPOSE screen: TO / CMD / [FOR] / TEXT / SEND with field focus.
+
+    Layout (standard layout, CMD != MSG_TO):
+
+      ┌────────────────────────────────────────┐
+      │ COMPOSE                  UTC HH:MM:SS  │
+      ├────────────────────────────────────────┤
+      │  TO    [K1ABC▎          ]              │
+      │  CMD    ▾ FREE          (↑↓ to cycle)  │
+      │  TEXT  ┌────────────────────────────┐  │
+      │        │ hello dave!▎               │  │
+      │        └────────────────────────────┘  │
+      │              [   SEND   ]              │
+      ├────────────────────────────────────────┤
+      │ Tab next · Enter send · Esc cancel     │
+      └────────────────────────────────────────┘
+
+    Layout for MSG TO (extra FOR row between CMD and TEXT):
+
+      │  TO    [K1ABC▎          ]              │
+      │  CMD    ▾ MSG TO       (↑↓ to cycle)   │
+      │  FOR   [KD8GIJ▎         ]              │  ← only for MSG TO
+      │  TEXT  ┌────────────────────────────┐  │
+
+    Focus styling:
+      - Focused field's label is FG_GOOD; unfocused labels are FG_DIM.
+      - The TO and FOR values are coloured by HEARD-age (green/amber/
+        grey) when the value was picked from the heard dropdown
+        (i.e., ``compose_to_heard_index`` / ``compose_for_heard_index``
+        is not None). When the operator typed free-form, the colour
+        is plain FG. Empty fields are FG_DIM.
+      - The CMD field has ↕ glyphs flanking the value when focused.
+      - The SEND button inverts when focused.
+
+    TX warning priority (highest first):
+      1. TO empty                    → "TO callsign required"
+      2. FOR empty (MSG TO only)     → "FOR callsign required"
+      3. TO == our own call (non-STORE) → "TO cannot be your own call"
+      4. MSG TO with FOR == TO       → "FOR cannot equal TO"
+      5. TX OFF                      → "TX OFF — configure station"
+      6. No time source              → "queued — awaiting time sync"
+
+    STORE is exempt from #3 and #5 (it's a local action, doesn't
+    transmit — no gfsk8 strip risk, no TX gate required).
+    """
+    img, draw = _new_canvas()
+    _draw_header(draw, fonts, "COMPOSE", state)
+
+    focused = state.compose_focused_field
+    label_w = 44
+    cmd = state.compose_cmd
+    is_msg_to = (cmd is ComposeCmd.MSG_TO)
+
+    y = theme.BODY_Y0 + 6
+
+    # ── TO row ──────────────────────────────────────────────────────
+    is_to_focus = (focused == "compose_to")
+    label_color = theme.FG_GOOD if is_to_focus else theme.FG_DIM
+    draw.text((theme.PAD_X, y), "TO", font=fonts.body, fill=label_color)
+    box_x0 = theme.PAD_X + label_w
+    box_x1 = theme.SCREEN_W - theme.PAD_X
+    if is_to_focus:
+        draw.rectangle(
+            [(box_x0 - 2, y - 2), (box_x1, y + 16)],
+            outline=theme.FG_GOOD,
+        )
+    to_text = state.compose_to or ""
+    if is_to_focus:
+        to_text = to_text + "▎"
+    # Colour by source: if picked from heard dropdown, use HEARD-age
+    # colour so operator sees freshness; else plain FG / FG_DIM.
+    to_color = _compose_field_color(
+        value=state.compose_to,
+        heard_index=state.compose_to_heard_index,
+        heard_list=state.heard,
+        callsign=state.callsign,
+    )
+    draw.text((box_x0, y), to_text, font=fonts.body, fill=to_color)
+    y += 22
+
+    # ── CMD row ─────────────────────────────────────────────────────
+    is_cmd_focus = (focused == "compose_cmd")
+    label_color = theme.FG_GOOD if is_cmd_focus else theme.FG_DIM
+    draw.text((theme.PAD_X, y), "CMD", font=fonts.body, fill=label_color)
+    cmd_label = cmd.value if cmd.value else "(free)"
+    cmd_text = f"↕ {cmd_label}" if is_cmd_focus else cmd_label
+    if is_cmd_focus:
+        draw.rectangle(
+            [(box_x0 - 2, y - 2), (box_x1, y + 16)],
+            outline=theme.FG_GOOD,
+        )
+    draw.text((box_x0, y), cmd_text, font=fonts.body, fill=theme.FG)
+    y += 22
+
+    # ── FOR row (only when MSG TO) ──────────────────────────────────
+    if is_msg_to:
+        is_for_focus = (focused == "compose_for")
+        label_color = theme.FG_GOOD if is_for_focus else theme.FG_DIM
+        draw.text(
+            (theme.PAD_X, y), "FOR",
+            font=fonts.body, fill=label_color,
+        )
+        if is_for_focus:
+            draw.rectangle(
+                [(box_x0 - 2, y - 2), (box_x1, y + 16)],
+                outline=theme.FG_GOOD,
+            )
+        for_text = state.compose_for or ""
+        if is_for_focus:
+            for_text = for_text + "▎"
+        for_color = _compose_field_color(
+            value=state.compose_for,
+            heard_index=state.compose_for_heard_index,
+            heard_list=state.heard,
+            callsign=state.callsign,
+        )
+        draw.text((box_x0, y), for_text, font=fonts.body, fill=for_color)
+        y += 22
+
+    # ── TEXT row ────────────────────────────────────────────────────
+    is_text_focus = (focused == "compose_text")
+    label_color = theme.FG_GOOD if is_text_focus else theme.FG_DIM
+    draw.text((theme.PAD_X, y), "TEXT", font=fonts.body, fill=label_color)
+    text_box_y0 = y + 18
+    # Shorter TEXT box when MSG_TO is showing the FOR row, so the
+    # whole layout still fits above the SEND button without
+    # overflowing the screen.
+    text_box_h = 40 if is_msg_to else 56
+    text_box_y1 = text_box_y0 + text_box_h
+    box = (theme.PAD_X, text_box_y0, theme.SCREEN_W - theme.PAD_X, text_box_y1)
+    draw.rectangle(
+        box,
+        outline=theme.FG_GOOD if is_text_focus else theme.SEPARATOR,
+    )
+    text_value = state.compose_text or ""
+    inner_x = box[0] + 4
+    inner_y_top = box[1] + 4
+    inner_w = (box[2] - box[0]) - 8
+    line_h = 16
+    n_lines_visible = max(1, (box[3] - box[1] - 8) // line_h)
+
+    def _wrap_to_lines(s: str, with_caret: bool) -> list[str]:
+        if not s and not with_caret:
+            return [""]
+        if with_caret:
+            s = s + "▎"
+        out: list[str] = []
+        for paragraph in s.split("\n"):
+            words = paragraph.split(" ")
+            cur = ""
+            for w_i, word in enumerate(words):
+                # The space we'd add before this word (none for first).
+                sep = "" if cur == "" else " "
+                candidate = cur + sep + word
+                try:
+                    cw = int(draw.textlength(candidate, font=fonts.body))
+                except Exception:
+                    cw = 8 * len(candidate)
+                if cw <= inner_w:
+                    cur = candidate
+                    continue
+                # Would overflow. If cur has content, flush it; else
+                # the word itself is wider than inner_w, break char-
+                # by-char.
+                if cur:
+                    out.append(cur)
+                    cur = ""
+                # Pack chars from `word` until we'd overflow, then
+                # break the line; loop with remainder.
+                remainder = word
+                while remainder:
+                    i = len(remainder)
+                    while i > 0:
+                        try:
+                            piece_w = int(draw.textlength(
+                                remainder[:i], font=fonts.body))
+                        except Exception:
+                            piece_w = 8 * i
+                        if piece_w <= inner_w:
+                            break
+                        i -= 1
+                    if i <= 0:  # safety: even 1 char doesn't fit
+                        i = 1
+                    if i == len(remainder):
+                        cur = remainder
+                        remainder = ""
+                    else:
+                        out.append(remainder[:i])
+                        remainder = remainder[i:]
+            out.append(cur)
+        return out or [""]
+
+    lines = _wrap_to_lines(text_value, with_caret=is_text_focus)
+    # Scroll: keep last N lines visible (the operator sees what
+    # they've most recently typed).
+    if len(lines) > n_lines_visible:
+        lines = lines[-n_lines_visible:]
+    # Render
+    iy = inner_y_top
+    body_color = theme.FG if state.compose_text else theme.FG_DIM
+    for line in lines:
+        draw.text((inner_x, iy), line, font=fonts.body, fill=body_color)
+        iy += line_h
+    y = text_box_y1 + 8
+
+
+    # ── SEND button ─────────────────────────────────────────────────
+    is_send_focus = (focused == "compose_send")
+    btn_w = 96
+    btn_h = 22
+    btn_x0 = (theme.SCREEN_W - btn_w) // 2
+    btn = (btn_x0, y, btn_x0 + btn_w, y + btn_h)
+    if is_send_focus:
+        # Filled inverted button — looks pressable.
+        draw.rectangle(btn, fill=theme.HEADER_BG, outline=theme.FG_GOOD)
+        send_color = theme.FG_GOOD
+    else:
+        draw.rectangle(btn, outline=theme.FG_DIM)
+        send_color = theme.FG_DIM
+    try:
+        send_w = int(draw.textlength("SEND", font=fonts.body))
+    except Exception:
+        send_w = 40
+    send_x = btn_x0 + (btn_w - send_w) // 2
+    send_y = y + (btn_h - 14) // 2 - 1
+    draw.text((send_x, send_y), "SEND", font=fonts.body, fill=send_color)
+    y = btn[3] + 4
+
+    # ── TX-state hint ───────────────────────────────────────────────
+    # Validation priority (highest first):
+    #   1. TO empty                       → "TO callsign required"
+    #   2. FOR empty (MSG TO only)        → "FOR callsign required"
+    #   3. TO == our own call (non-STORE) → "TO cannot be your own call"
+    #   4. MSG TO with FOR == TO          → "FOR cannot equal TO"
+    #   5. TX OFF (non-STORE)             → "TX OFF — configure station"
+    #   6. No time source (non-STORE)     → "queued — awaiting time sync"
+    #
+    # STORE is exempt from the SELF and TX-OFF gates — it's a local
+    # mailbox write, no on-air activity. STORE still requires a
+    # non-empty TO and TEXT.
+    is_store = (cmd is ComposeCmd.STORE)
+    is_query_msg = (cmd is ComposeCmd.QUERY_MSG)
+    to_upper = (state.compose_to or "").strip().upper()
+    for_upper = (state.compose_for or "").strip().upper()
+    own_upper = (state.callsign or "").strip().upper()
+    text_stripped = (state.compose_text or "").strip()
+
+    tx_warning: Optional[str] = None
+    if not to_upper:
+        tx_warning = "TO callsign required"
+    elif is_msg_to and not for_upper:
+        tx_warning = "FOR callsign required"
+    elif (
+        not is_store
+        and to_upper and own_upper
+        and to_upper == own_upper
+    ):
+        tx_warning = "TO cannot be your own call"
+    elif is_msg_to and for_upper and to_upper and for_upper == to_upper:
+        tx_warning = "FOR cannot equal TO"
+    elif is_query_msg and not text_stripped:
+        # QUERY MSG needs a numeric mailbox id — empty TEXT field has
+        # its own distinct error so the operator knows what to type.
+        tx_warning = "MSG ID required (number)"
+    elif is_query_msg and not text_stripped.isdigit():
+        # Caught typo / accidental keyboard input. Numeric-only is
+        # the JS8Call wire contract for buffered-id lookup.
+        tx_warning = "MSG ID must be a number"
+    elif not is_store and not state.tx_allowed:
+        tx_warning = "TX OFF — configure station"
+    elif not is_store and not state.time_source:
+        tx_warning = "queued — awaiting time sync"
+
+    if tx_warning:
+        try:
+            w = int(draw.textlength(tx_warning, font=fonts.small))
+        except Exception:
+            w = 6 * len(tx_warning)
+        draw.text(
+            ((theme.SCREEN_W - w) // 2, y),
+            tx_warning, font=fonts.small, fill=theme.FG_WARN,
+        )
+
+    # ── Footer hint, contextual to focus ────────────────────────────
+    if is_to_focus:
+        # Empty heard list → no dropdown available, just typing.
+        has_heard = any(
+            (st.callsign or "").upper() != own_upper
+            for st in state.heard
+        )
+        if has_heard:
+            hint = "↑↓ heard · type call · Tab next"
+        else:
+            hint = "type call · Tab next · Esc cancel"
+    elif is_cmd_focus:
+        hint = "↑↓ cycle · Tab next · Esc cancel"
+    elif focused == "compose_for":
+        has_heard = any(
+            (st.callsign or "").upper() != own_upper
+            for st in state.heard
+        )
+        if has_heard:
+            hint = "↑↓ heard · type call · Tab next"
+        else:
+            hint = "type call · Tab next · Esc cancel"
+    elif is_text_focus:
+        hint = "type · Bksp del · Tab next · Esc cancel"
+    elif is_send_focus:
+        # STORE's verb is "store locally"; transmits is "send".
+        action = "store" if is_store else "send"
+        hint = f"Enter {action} · Tab next · Esc cancel"
+    else:
+        hint = "Tab pick field · Esc cancel"
+    _draw_footer(draw, fonts, hint)
+    return img
+
+
+def _render_allcall(state: UISnapshot, fonts: Fonts) -> Image.Image:
+    """ALLCALL screen — three-row menu (HEARTBEAT / QUERY MSGS / CQ).
+
+    The focused row is highlighted with the accent background so the
+    operator knows which row Enter will act on. The HEARTBEAT row's
+    value reads the live mode from ``state.hb_mode`` and tints amber-
+    coloured (FG_WARN) when not OFF — the same convention the HOME
+    HB row uses for "this is actively transmitting on a schedule",
+    catching the eye without screaming.
+    """
+    img, draw = _new_canvas()
+    _draw_header(draw, fonts, "ALLCALL", state)
+    y = theme.BODY_Y0 + 12
+    items = (
+        ("HEARTBEAT",  state.hb_mode.value),
+        ("QUERY MSGS", "send"),
+        ("CQ",         "send"),
+    )
+    focus = state.allcall_focus
+    row_h = 32
+    for i, (label, value) in enumerate(items):
+        is_focused = (i == focus)
+        # Selection highlight — subtle dark-blue background band.
+        if is_focused:
+            draw.rectangle(
+                [(0, y - 4), (theme.SCREEN_W, y + row_h - 12)],
+                fill=theme.ACCENT_BG,
+            )
+        # Label: accent when focused for unambiguous "this is selected".
+        label_color = theme.ACCENT if is_focused else theme.FG
+        draw.text(
+            (theme.PAD_X + 4, y),
+            label, font=fonts.body, fill=label_color,
+        )
+        if value:
+            try:
+                vw = int(draw.textlength(value, font=fonts.body))
+            except Exception:
+                vw = 7 * len(value)
+            # HEARTBEAT row's value color signals active mode at a
+            # glance: FG_WARN (amber) when running, FG_DIM when OFF.
+            # Other rows ("send") use FG_DIM consistently.
+            if i == 0:
+                value_color = (
+                    theme.FG_WARN
+                    if state.hb_mode is not HbMode.OFF
+                    else theme.FG_DIM
+                )
+            else:
+                value_color = theme.FG_DIM
+            draw.text(
+                (theme.SCREEN_W - vw - theme.PAD_X - 4, y),
+                value, font=fonts.body, fill=value_color,
+            )
+        y += row_h
+    _draw_footer(draw, fonts, "↑ ↓ pick · Enter invoke")
+    return img
+
+
+def _render_hb_mode_select(state: UISnapshot, fonts: Fonts) -> Image.Image:
+    """HB_MODE_SELECT modal sub-screen — pick the heartbeat cadence.
+
+    Four-row dropdown over HB_MODES_ORDERED. The currently-active
+    mode is marked with a leading "●" so the operator can see what's
+    running now without having to remember; the focused row (where
+    Enter will commit) is highlighted with the accent background.
+
+    Esc cancels (returns to ALLCALL without changing mode); Enter
+    commits the focused selection.
+    """
+    img, draw = _new_canvas()
+    _draw_header(draw, fonts, "HEARTBEAT", state)
+    y = theme.BODY_Y0 + 8
+    # Sub-title: shows current mode, for context. Even after the
+    # operator opens the modal, this stays a small reminder that
+    # they haven't committed yet — until Enter, hb_mode is still the
+    # old value.
+    draw.text(
+        (theme.PAD_X + 4, y),
+        f"Current: {state.hb_mode.value}",
+        font=fonts.small,
+        fill=theme.FG_DIM,
+    )
+    y += 18
+    draw.line(
+        [(0, y), (theme.SCREEN_W - 1, y)], fill=theme.SEPARATOR
+    )
+    y += 6
+    row_h = 28
+    focus = state.hb_select_focus
+    for i, mode in enumerate(HB_MODES_ORDERED):
+        is_focused = (i == focus)
+        is_active = (mode is state.hb_mode)
+        if is_focused:
+            draw.rectangle(
+                [(0, y - 4), (theme.SCREEN_W, y + row_h - 10)],
+                fill=theme.ACCENT_BG,
+            )
+        # Marker on the currently-active mode.
+        marker = "●" if is_active else " "
+        marker_color = (
+            theme.FG_GOOD if is_active else theme.SEPARATOR
+        )
+        draw.text(
+            (theme.PAD_X + 4, y),
+            marker, font=fonts.body, fill=marker_color,
+        )
+        # Mode label
+        label_color = theme.ACCENT if is_focused else theme.FG
+        draw.text(
+            (theme.PAD_X + 22, y),
+            mode.value, font=fonts.body, fill=label_color,
+        )
+        y += row_h
+    _draw_footer(draw, fonts, "↑ ↓ pick · Enter commit · Esc cancel")
+    return img
+
+
+def _render_directed_menu(state: UISnapshot, fonts: Fonts) -> Image.Image:
+    img, draw = _new_canvas()
+    _draw_header(draw, fonts, "DIRECTED MENU", state)
+    y = theme.BODY_Y0 + 4
+    # Selected callsign at the top
+    draw.text(
+        (theme.PAD_X, y),
+        "Target: (none selected)",
+        font=fonts.body,
+        fill=theme.FG_DIM,
+    )
+    y += 22
+    draw.line(
+        [(0, y), (theme.SCREEN_W - 1, y)], fill=theme.SEPARATOR
+    )
+    y += 4
+    actions = ("MSG", "STORE", "AGN?", "SNR?", "GRID", "QUERY", "MYLOC")
+    for act in actions:
+        draw.text(
+            (theme.PAD_X + 4, y), act, font=fonts.body, fill=theme.FG
+        )
+        y += 18
+    _draw_footer(draw, fonts, "Pick from Heard List first (Step 3)")
+    return img
+
+
+def _render_emergency(state: UISnapshot, fonts: Fonts) -> Image.Image:
+    img, draw = _new_canvas()
+    _draw_header(draw, fonts, "EMERGENCY", state)
+    # Body — large bold "SEND HELP" centered, then position display.
+    text = "SEND HELP"
+    bbox = fonts.large_bold.getbbox(text)
+    tw = bbox[2] - bbox[0]
+    draw.text(
+        ((theme.SCREEN_W - tw) // 2, theme.BODY_Y0 + 14),
+        text,
+        font=fonts.large_bold,
+        fill=theme.FG_BAD,
+    )
+    y = theme.BODY_Y0 + 14 + (bbox[3] - bbox[1]) + 16
+
+    # The emergency screen ALWAYS shows the operator's actual position
+    # as lat/lon when a GPS fix is available — not the grid. Rationale:
+    # in a real emergency the most useful data we can hand a rescuer
+    # (or transmit on-air) is exact coordinates. Grid squares
+    # (Maidenhead) are a JS8-convention compact representation but
+    # they introduce 5-15 km ambiguity at FN42-precision and only
+    # come down to ~25 m at FN42aa00 — still less precise than
+    # decimal-degree GPS. We display the raw fix and let the operator
+    # read coordinates over voice to anyone who needs them.
+    if state.emergency_override:
+        # Unconfigured-emergency mode: N0CALL identity, GPS required.
+        draw.text((theme.PAD_X, y), "ID:", font=fonts.body, fill=theme.FG_DIM)
+        draw.text(
+            (theme.PAD_X + 32, y), "N0CALL (unconfigured)",
+            font=fonts.body, fill=theme.FG_BAD,
+        )
+        y += 24
+        draw.text((theme.PAD_X, y), "Pos:", font=fonts.body, fill=theme.FG_DIM)
+        if state.gps.has_position and state.gps.lat is not None and state.gps.lon is not None:
+            pos = f"{state.gps.lat:+.4f}, {state.gps.lon:+.4f}"
+            draw.text(
+                (theme.PAD_X + 32, y), pos,
+                font=fonts.body_mono, fill=theme.FG_GOOD,
+            )
+            y += 24
+            draw.text(
+                (theme.PAD_X, y),
+                "Beacon: not armed (Step 6)",
+                font=fonts.small, fill=theme.FG_DIM,
+            )
+            _draw_footer(draw, fonts, "TX armed — beacon arming in Step 6")
+        else:
+            draw.text(
+                (theme.PAD_X + 32, y), "no GPS fix yet",
+                font=fonts.body, fill=theme.FG_BAD,
+            )
+            y += 24
+            status_lines = (
+                "Waiting for GPS fix —",
+                "ensure unobstructed",
+                "view of sky!",
+            )
+            for line in status_lines:
+                draw.text(
+                    (theme.PAD_X + 4, y), line,
+                    font=fonts.small, fill=theme.FG_WARN,
+                )
+                y += 14
+            _draw_footer(draw, fonts, "TX blocked until GPS fix arrives")
+    else:
+        # Normal-mode emergency screen: configured station.
+        # Position priority: live GPS lat/lon > configured grid > no
+        # location. Lat/lon is preferred even when a grid is also
+        # configured, because the GPS fix is authoritative for the
+        # operator's CURRENT location and the configured grid may be
+        # stale or wrong (operator moved without updating settings).
+        draw.text(
+            (theme.PAD_X, y), "Position:", font=fonts.body, fill=theme.FG_DIM
+        )
+        y += 20
+        if state.gps.has_position and state.gps.lat is not None and state.gps.lon is not None:
+            pos = f"{state.gps.lat:+.4f}, {state.gps.lon:+.4f}"
+            draw.text(
+                (theme.PAD_X + 8, y), pos,
+                font=fonts.body_mono, fill=theme.FG_GOOD,
+            )
+            y += 20
+            draw.text(
+                (theme.PAD_X + 8, y), "(GPS)",
+                font=fonts.small, fill=theme.FG_DIM,
+            )
+        elif state.grid:
+            # Fall back to configured grid only when no GPS fix is
+            # available. Mark it as configured so the operator knows
+            # the position isn't live.
+            grid_str = f"{state.grid} (configured)"
+            draw.text(
+                (theme.PAD_X + 8, y), grid_str,
+                font=fonts.body, fill=theme.FG,
+            )
+        else:
+            draw.text(
+                (theme.PAD_X + 8, y), "no position",
+                font=fonts.body, fill=theme.FG_BAD,
+            )
+        y += 24
+        draw.text(
+            (theme.PAD_X, y),
+            "Beacon: not armed",
+            font=fonts.small,
+            fill=theme.FG_DIM,
+        )
+        _draw_footer(draw, fonts, "ARM: hold ENTER 3 s (Step 6)")
+    return img
+
+
+def _format_version_for_header(version: str) -> str:
+    """Format ``__version__`` for the SETUP header title bar.
+
+    SemVer keeps three components (MAJOR.MINOR.PATCH) for tooling
+    correctness, but operators reading a 240-px display don't need
+    the trailing ``.0`` of a fresh major/minor cut. Drop it for
+    readability — "V1.0" reads cleaner than "V1.0.0" in a 28-px
+    title bar — while preserving any non-zero PATCH for bug-fix
+    builds:
+
+      "1.0.0"      → "V1.0"
+      "1.0.5"      → "V1.0.5"
+      "1.1.0"      → "V1.1"
+      "1.2.3"      → "V1.2.3"
+      "1.0.0.dev1" → "V1.0.0.dev1"   (preserve prerelease tags)
+
+    Anything that doesn't parse as digit.digit.digit[.…] falls
+    through unchanged — defensive: an unexpected version string
+    shouldn't blow up rendering.
+    """
+    if not version:
+        return "V?"
+    parts = version.split(".")
+    if len(parts) >= 3:
+        # Trim a trailing ".0" PATCH only when nothing follows it
+        # (i.e. not a prerelease like 1.0.0.dev1).
+        if parts[2] == "0" and len(parts) == 3:
+            return "V" + ".".join(parts[:2])
+    return "V" + version
+
+
+def _render_setup(state: UISnapshot, fonts: Fonts) -> Image.Image:
+    img, draw = _new_canvas()
+    # Title includes the runtime version so operators in the field
+    # can identify build vs. spec mismatches at a glance (e.g. when
+    # a forum question references a specific feature, they can read
+    # back "I'm on V1.0" without remembering to check About). Source
+    # of truth is minijs8.__version__ → minijs8/version.py → kept in
+    # sync with pyproject.toml by tests/test_version_sync.py.
+    # The header formatter trims trailing ".0" so the display is
+    # always the marketing-friendly form ("V1.0" not "V1.0.0").
+    _draw_header(
+        draw, fonts,
+        f"SETUP {_format_version_for_header(__version__)}",
+        state,
+    )
+
+    # Each row: label, displayed value (or current edit buffer), color.
+    # Focus highlights with a left chevron + accent color; edit mode
+    # adds a caret at the end of the buffer.
+    rows = _setup_rows(state)
+
+    y = theme.BODY_Y0 + 6
+    row_h = 22
+    label_w = 64
+
+    for field_name, label, value, value_color in rows:
+        is_focused = (state.focused_field == field_name) and not state.editing_field
+        is_editing = state.editing_field == field_name
+
+        # Focus chevron / row highlight
+        if is_focused:
+            draw.rectangle(
+                [(0, y - 2), (theme.SCREEN_W - 1, y + row_h - 4)],
+                fill=theme.ACCENT_BG,
+            )
+        if is_editing:
+            draw.rectangle(
+                [(0, y - 2), (theme.SCREEN_W - 1, y + row_h - 4)],
+                outline=theme.ACCENT,
+            )
+
+        # Label
+        label_color = theme.FG if is_focused else theme.FG_DIM
+        draw.text((theme.PAD_X, y), label, font=fonts.body, fill=label_color)
+
+        # Value (or live edit buffer + caret)
+        if is_editing:
+            buf = state.edit_buffer
+            color = theme.FG_BAD if state.edit_invalid else theme.ACCENT
+            draw.text(
+                (theme.PAD_X + label_w, y), buf + "_",
+                font=fonts.body, fill=color,
+            )
+        else:
+            draw.text(
+                (theme.PAD_X + label_w, y), value,
+                font=fonts.body, fill=value_color,
+            )
+        y += row_h
+
+    # ── Emergency bypass row ────────────────────────────────────────
+    # A labeled, focusable button at the bottom of the Setup screen.
+    # Activated by Tab-into-it then Enter (no hold gesture).
+    is_em_focused = (
+        state.focused_field == "emergency_bypass" and not state.editing_field
+    )
+    em_y = y + 8
+    if is_em_focused:
+        draw.rectangle(
+            [(theme.PAD_X, em_y), (theme.SCREEN_W - theme.PAD_X, em_y + 24)],
+            fill=theme.EMERGENCY_BG,
+        )
+        em_color = theme.EMERGENCY_FG
+    else:
+        draw.rectangle(
+            [(theme.PAD_X, em_y), (theme.SCREEN_W - theme.PAD_X, em_y + 24)],
+            outline=theme.FG_BAD,
+        )
+        em_color = theme.FG_BAD
+    em_text = "[EMERGENCY BEACON →]"
+    bbox = fonts.body.getbbox(em_text)
+    tw = bbox[2] - bbox[0]
+    draw.text(
+        ((theme.SCREEN_W - tw) // 2, em_y + 5),
+        em_text,
+        font=fonts.body,
+        fill=em_color,
+    )
+
+    # Footer
+    if state.editing_field:
+        if state.edit_invalid:
+            _draw_footer(draw, fonts, "invalid value · Enter retry · Esc cancel")
+        else:
+            _draw_footer(draw, fonts, "type · Enter save · Esc cancel")
+    elif not state.tx_allowed:
+        _draw_footer(draw, fonts, "Tab field · Enter edit · set Call+Grid first")
+    else:
+        _draw_footer(draw, fonts, "Tab field · Enter edit · ← → ring nav")
+    return img
+
+
+def _setup_rows(state: UISnapshot) -> list[tuple[str, str, str, tuple[int, int, int]]]:
+    """Build the (field_name, label, displayed_value, color) tuples."""
+    callsign_color = theme.FG if state.callsign != "N0CALL" else theme.FG_BAD
+    grid_color = theme.FG if state.grid else theme.FG_BAD
+    grid_display = state.grid if state.grid else "(unset)"
+    freq_mhz = state.freq_hz / 1_000_000.0
+    # Radio row: show the human-readable display name from the
+    # registry. Pressing Enter on this row cycles to the next radio,
+    # saves config.toml, and exits — systemd's Restart=always brings
+    # the daemon back up with the new radio path active. Always-
+    # consistent: what you see is what's running.
+    try:
+        from minijs8.cat.radios import get_radio
+        radio_label = get_radio(state.radio_id).display_name
+    except Exception:
+        # Unknown id (shouldn't reach here — config validation
+        # rejects unknowns). Show the raw id as a defensive fallback.
+        radio_label = state.radio_id
+    # Groups row: displays the comma-separated configured groups, or
+    # "(none)" in dim grey when empty. The display value is what the
+    # operator types — comma-separated with the '@' prefix on each.
+    # Dim grey for empty (not red): groups are optional, an empty
+    # list isn't a misconfiguration.
+    if state.groups:
+        groups_display = ", ".join(state.groups)
+        groups_color = theme.FG
+    else:
+        groups_display = "(none)"
+        groups_color = theme.FG_DIM
+    return [
+        ("callsign", "Call",   state.callsign,                       callsign_color),
+        ("grid",     "Grid",   grid_display,                         grid_color),
+        ("groups",   "Groups", groups_display,                       groups_color),
+        ("units",    "Units",  state.units,                          theme.FG),
+        # Step 6: editable. Frequency goes through CAT to the radio.
+        ("freq_hz",  "Freq",   f"{freq_mhz:.3f} MHz",                theme.FG),
+        ("radio",    "Radio",  radio_label,                          theme.FG),
+        ("mode",     "Mode",   state.mode,                           theme.FG_DIM),
+        ("logs",     "Logs",   "30 days",                            theme.FG_DIM),
+    ]
+
+
+def _render_shutting_down(state: UISnapshot, fonts: Fonts) -> Image.Image:
+    """Confirmation screen during the both-buttons-held countdown."""
+    img, draw = _new_canvas()
+    # No header / footer here — full-bleed for clarity under stress.
+    # We use the title font (smaller than large_bold) so the string
+    # comfortably fits in 240 px.
+    title = "SHUTTING DOWN"
+    bbox = fonts.title.getbbox(title)
+    tw = bbox[2] - bbox[0]
+    th = bbox[3] - bbox[1]
+    title_y = 70
+    draw.text(
+        ((theme.SCREEN_W - tw) // 2, title_y),
+        title,
+        font=fonts.title,
+        fill=theme.FG,
+    )
+    sub = "release a button to cancel"
+    bbox = fonts.small.getbbox(sub)
+    sw = bbox[2] - bbox[0]
+    draw.text(
+        ((theme.SCREEN_W - sw) // 2, title_y + th + 10),
+        sub,
+        font=fonts.small,
+        fill=theme.FG_DIM,
+    )
+
+    # Progress bar — empties from full to zero across the 5-second hold.
+    bar_y = 170
+    bar_h = 18
+    bar_x0 = 24
+    bar_x1 = theme.SCREEN_W - 24
+    bar_w = bar_x1 - bar_x0
+    draw.rectangle(
+        [(bar_x0, bar_y), (bar_x1, bar_y + bar_h)], outline=theme.FG_DIM
+    )
+    fill_px = int(bar_w * state.shutdown_remaining)
+    if fill_px > 0:
+        draw.rectangle(
+            [(bar_x0, bar_y), (bar_x0 + fill_px, bar_y + bar_h)],
+            fill=theme.FG_BAD,
+        )
+
+    seconds_left = state.shutdown_remaining * 5.0
+    txt = f"{seconds_left:.1f} s"
+    bbox = fonts.body.getbbox(txt)
+    tw = bbox[2] - bbox[0]
+    draw.text(
+        ((theme.SCREEN_W - tw) // 2, bar_y + bar_h + 12),
+        txt,
+        font=fonts.body,
+        fill=theme.FG_DIM,
+    )
+    return img
+
+
+# ── Dispatch ─────────────────────────────────────────────────────────
+
+
+_RENDERERS: dict[Screen, Callable[[UISnapshot, Fonts], Image.Image]] = {
+    Screen.HOME:           _render_home,
+    Screen.HEARD:          _render_heard,
+    Screen.DIRECTED:       _render_directed,    # activity-log chat view
+    Screen.INBOX:          _render_inbox,       # mailbox / MSG content view
+    Screen.COMPOSE:        _render_compose,
+    Screen.ALLCALL:        _render_allcall,
+    Screen.DIRECTED_MENU:  _render_directed_menu,
+    Screen.EMERGENCY:      _render_emergency,
+    Screen.SETUP:          _render_setup,
+    Screen.SHUTTING_DOWN:  _render_shutting_down,
+    Screen.INBOX_DETAIL:   _render_inbox_detail,
+    Screen.HB_MODE_SELECT: _render_hb_mode_select,
+}
+
+
+def render(state: UISnapshot, fonts: Fonts) -> Image.Image:
+    """Render the screen indicated by ``state.screen``.
+
+    Catches and logs renderer exceptions, returning a fallback "render
+    error" frame instead of crashing the daemon. A misrendered field
+    is bad; a render thread that dies in a way that takes the radio
+    offline is far worse.
+    """
+    renderer = _RENDERERS.get(state.screen)
+    if renderer is None:
+        return _render_error(state, fonts, f"unknown screen {state.screen}")
+    try:
+        return renderer(state, fonts)
+    except Exception as exc:
+        _log.exception("renderer for %s raised", state.screen.name)
+        return _render_error(state, fonts, str(exc))
+
+
+def _render_error(
+    state: UISnapshot, fonts: Fonts, message: str
+) -> Image.Image:
+    img, draw = _new_canvas()
+    _draw_header(draw, fonts, "RENDER ERROR", state)
+    draw.text(
+        (theme.PAD_X, theme.BODY_Y0 + 8),
+        "screen render failed",
+        font=fonts.body,
+        fill=theme.FG_BAD,
+    )
+    # Wrap the message at ~30 chars.
+    y = theme.BODY_Y0 + 30
+    line = ""
+    for word in message.split():
+        if len(line) + len(word) + 1 > 30:
+            draw.text(
+                (theme.PAD_X, y), line, font=fonts.small, fill=theme.FG_DIM
+            )
+            y += 14
+            line = word
+        else:
+            line = f"{line} {word}".strip()
+        if y > theme.BODY_Y1 - 14:
+            break
+    if line and y <= theme.BODY_Y1 - 14:
+        draw.text(
+            (theme.PAD_X, y), line, font=fonts.small, fill=theme.FG_DIM
+        )
+    _draw_footer(draw, fonts, "see journalctl -u minijs8")
+    return img
