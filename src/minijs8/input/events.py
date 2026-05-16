@@ -36,6 +36,11 @@ class Key(enum.Enum):
     CTRL_Q = "CTRL_Q"
     CTRL_S = "CTRL_S"
     CTRL_C = "CTRL_C"
+    # Ctrl-X: keyboard-driven shutdown gesture. Parallels the
+    # both-buttons-held-5-seconds hardware gesture for operators
+    # working over SSH or with a USB keyboard attached. Five-second
+    # countdown after the keystroke; Esc cancels.
+    CTRL_X = "CTRL_X"
 
 
 @dataclass(frozen=True)

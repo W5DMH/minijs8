@@ -24,10 +24,13 @@ the entire keyboard pipeline testable without GPIO, evdev, or the TFT.
 from __future__ import annotations
 
 import logging
-from typing import Awaitable, Callable, Optional
+from typing import TYPE_CHECKING, Awaitable, Callable, Optional
 
 from minijs8.input.events import Key, KeyEvent
 from minijs8.ui.state import ComposeCmd, Screen, UIState
+
+if TYPE_CHECKING:
+    from minijs8.input.shutdown_gesture import ShutdownGesture
 
 _log = logging.getLogger(__name__)
 
@@ -74,6 +77,7 @@ class InputRouter:
         compose_store: Optional[Callable[[str, str], bool]] = None,
         allcall_query_msgs: Optional[Callable[[], bool]] = None,
         allcall_cq: Optional[Callable[[], bool]] = None,
+        shutdown_gesture: Optional["ShutdownGesture"] = None,
     ) -> None:
         self._ui = ui
         # save_config(callsign, grid, units, new_groups=None) -> True
@@ -132,6 +136,13 @@ class InputRouter:
         # Called when the operator presses Enter on the CQ row of the
         # ALLCALL screen. Optional, same fallback as above.
         self._allcall_cq = allcall_cq
+        # shutdown_gesture is the shared ShutdownGesture instance —
+        # same one ButtonWatcher holds — so keyboard Ctrl-X and
+        # button-hold cooperate cleanly (idempotent arming, single
+        # cancel path). Optional in the constructor so tests that
+        # don't exercise the shutdown path can omit it; the Ctrl-X
+        # hotkey is a quiet no-op when not provided.
+        self._shutdown_gesture = shutdown_gesture
 
     def handle(self, event: KeyEvent) -> None:
         """Top-level dispatcher. Wraps any handler exception so a
@@ -304,6 +315,21 @@ class InputRouter:
 
     def _handle_global_hotkey(self, key: Key, snapshot) -> bool:
         """Returns True if the key was consumed as a global hotkey."""
+        # Ctrl-X: keyboard shutdown gesture. Works UNCONDITIONALLY —
+        # an operator must be able to gracefully power down the
+        # device whether or not the station is configured, whether
+        # or not TX is allowed, whether or not emergency override is
+        # active. The actual shutdown is gated by polkit on the
+        # systemctl call, not by app state. ``cancel via Esc`` is
+        # handled in the per-screen SHUTTING_DOWN handler below.
+        if key is Key.CTRL_X:
+            if self._shutdown_gesture is not None:
+                self._shutdown_gesture.arm(source="keyboard Ctrl-X")
+            else:
+                _log.warning(
+                    "Ctrl-X pressed but no shutdown gesture configured"
+                )
+            return True
         # Even unconfigured stations can use Ctrl-S to jump to Setup
         # (it's where they need to be anyway). Other hotkeys we gate.
         if key is Key.CTRL_S:
@@ -328,6 +354,28 @@ class InputRouter:
     # ── Per-screen handlers ──────────────────────────────────────────
 
     def _handle_screen_key(self, event: KeyEvent, snapshot) -> None:
+        # SHUTTING_DOWN: any keystroke that means "cancel" rolls the
+        # gesture back. Esc and Ctrl-C are the natural cancels;
+        # other keys are ignored so an operator who happens to be
+        # typing when Ctrl-X fires doesn't accidentally CONFIRM
+        # shutdown (there is no confirm — completion is automatic
+        # after the 5 s hold). The button watcher's cancel path is
+        # separate (button release); they share the gesture object
+        # so cancellation from either path takes effect.
+        if snapshot.screen is Screen.SHUTTING_DOWN:
+            if event.key is Key.ESC or event.key is Key.CTRL_C:
+                if self._shutdown_gesture is not None:
+                    self._shutdown_gesture.cancel(source="keyboard Esc")
+                else:
+                    # Defensive fallback: no gesture object configured
+                    # but somehow we landed on SHUTTING_DOWN. Roll
+                    # back the UI so the operator isn't stranded.
+                    self._ui.cancel_shutdown()
+                return
+            # Other keystrokes are dropped — the countdown ticks on
+            # to completion. Operator can press Esc at any moment.
+            return
+
         # Inbox detail view: Esc returns to the list, Del deletes the
         # currently-viewed row and returns. ↑/↓ are reserved for
         # future scroll-within-body, currently no-op. Other keys

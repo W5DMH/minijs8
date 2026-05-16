@@ -37,9 +37,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, Awaitable, Callable, Optional, Protocol
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional, Protocol
 
 from minijs8.ui.state import UIState
+
+if TYPE_CHECKING:
+    from minijs8.input.shutdown_gesture import ShutdownGesture
 
 _log = logging.getLogger(__name__)
 
@@ -79,15 +82,34 @@ class ButtonWatcher:
         self,
         ui_state: UIState,
         loop: asyncio.AbstractEventLoop,
-        shutdown_callback: ShutdownCallback,
+        shutdown_callback: Optional[ShutdownCallback] = None,
         *,
+        shutdown_gesture: Optional["ShutdownGesture"] = None,
         # Injectable for tests.
         button_top: Optional[_ButtonLike] = None,
         button_bottom: Optional[_ButtonLike] = None,
     ) -> None:
+        # ShutdownGesture is the new shared owner of the countdown +
+        # final callback. Old call sites passing ``shutdown_callback``
+        # directly are still supported — we construct a private
+        # gesture from it. New callers (May 2026, Ctrl-X keyboard
+        # shutdown) pass a pre-built gesture so the SAME instance
+        # is shared with the InputRouter. Sharing ensures the two
+        # input methods cooperate: keyboard arm + button release
+        # is a no-op (different gesture instance issue avoided),
+        # and double-arming from either path is idempotent.
+        if shutdown_gesture is not None:
+            self._gesture = shutdown_gesture
+        elif shutdown_callback is not None:
+            from minijs8.input.shutdown_gesture import ShutdownGesture
+            self._gesture = ShutdownGesture(ui_state, loop, shutdown_callback)
+        else:
+            raise ValueError(
+                "ButtonWatcher needs either shutdown_callback or "
+                "shutdown_gesture"
+            )
         self._ui = ui_state
         self._loop = loop
-        self._shutdown_cb = shutdown_callback
         self._button_top: Optional[_ButtonLike] = button_top
         self._button_bottom: Optional[_ButtonLike] = button_bottom
 
@@ -96,7 +118,6 @@ class ButtonWatcher:
         # call_soon_threadsafe.
         self._top_pressed_at: Optional[float] = None
         self._bot_pressed_at: Optional[float] = None
-        self._shutdown_task: Optional[asyncio.Task[None]] = None
         # When True, the current press cycle has been "consumed" by a
         # shutdown gesture; releases of either button must NOT fire
         # the single-press ring-navigation action. Reset only when
@@ -133,9 +154,11 @@ class ButtonWatcher:
 
     def stop(self) -> None:
         """Release GPIO and cancel any pending shutdown task."""
-        if self._shutdown_task is not None and not self._shutdown_task.done():
-            self._shutdown_task.cancel()
-            self._shutdown_task = None
+        # Delegate to shared gesture — safe to call when nothing is
+        # armed (no-op return). Other input paths (keyboard) might
+        # also share the gesture; cancelling here is correct since
+        # ``stop`` means "we're tearing down inputs".
+        self._gesture.cancel(source="ButtonWatcher.stop")
         for btn in (self._button_top, self._button_bottom):
             if btn is not None:
                 try:
@@ -229,50 +252,20 @@ class ButtonWatcher:
     # ── Shutdown gesture ─────────────────────────────────────────────
 
     def _maybe_arm_shutdown(self) -> None:
-        """If both buttons are now down, kick off the countdown task."""
+        """If both buttons are now down, kick off the countdown."""
         if self._top_pressed_at is None or self._bot_pressed_at is None:
             return
-        if self._shutdown_task is not None and not self._shutdown_task.done():
-            return  # already armed
-        _log.info("both buttons held — arming shutdown countdown")
-        # Mark this press cycle so the eventual releases don't ALSO
-        # trigger single-button navigation actions.
-        self._gesture_consumed = True
-        self._ui.begin_shutdown()
-        self._shutdown_task = self._loop.create_task(self._shutdown_countdown())
+        # The shared ShutdownGesture is idempotent — if a keyboard
+        # Ctrl-X already armed it, arm() is a no-op here. Either
+        # path can win the race.
+        if self._gesture.arm(source="buttons"):
+            # Mark this press cycle so the eventual releases don't
+            # ALSO trigger single-button navigation actions.
+            self._gesture_consumed = True
 
     def _cancel_shutdown_if_armed(self) -> None:
-        """Cancel the countdown task and roll the UI back."""
-        if self._shutdown_task is not None and not self._shutdown_task.done():
-            _log.info("shutdown gesture cancelled (button released)")
-            self._shutdown_task.cancel()
-            self._shutdown_task = None
-            self._ui.cancel_shutdown()
-
-    async def _shutdown_countdown(self) -> None:
-        """Tick the progress bar and fire the shutdown when done."""
-        start = time.monotonic()
-        try:
-            while True:
-                elapsed = time.monotonic() - start
-                remaining_frac = max(0.0, 1.0 - elapsed / SHUTDOWN_HOLD_S)
-                self._ui.update_shutdown_progress(remaining_frac)
-                if elapsed >= SHUTDOWN_HOLD_S:
-                    break
-                await asyncio.sleep(_SHUTDOWN_TICK_S)
-        except asyncio.CancelledError:
-            # Cancellation = user released a button. cancel_shutdown_if_armed()
-            # has already restored the previous screen via UIState.
-            raise
-
-        _log.warning("shutdown countdown complete — invoking shutdown callback")
-        try:
-            await self._shutdown_cb()
-        except Exception:
-            _log.exception("shutdown callback raised")
-            # Roll the UI back so we don't sit on the SHUTTING_DOWN screen
-            # forever if the systemctl call somehow failed.
-            self._ui.cancel_shutdown()
+        """Cancel the countdown and roll the UI back."""
+        self._gesture.cancel(source="buttons")
 
 
 # ── Default shutdown callbacks ───────────────────────────────────────

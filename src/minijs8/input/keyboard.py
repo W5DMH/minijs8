@@ -159,6 +159,7 @@ _CTRL_KEYS: dict[str, Key] = {
     "q": Key.CTRL_Q,
     "s": Key.CTRL_S,
     "c": Key.CTRL_C,
+    "x": Key.CTRL_X,
 }
 
 

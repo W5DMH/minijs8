@@ -219,6 +219,20 @@ class MiniJS8App:
             self._ui_state.set_screen(Screen.SETUP)
 
         # ── Input router ────────────────────────────────────────────
+        # Shared shutdown-gesture object. ButtonWatcher and InputRouter
+        # both hold a reference so the keyboard Ctrl-X gesture and
+        # the hardware both-buttons-held gesture cooperate via a
+        # single owner. Idempotent arming means the two paths can
+        # race without producing two countdown tasks; either path's
+        # natural cancel (button release; keyboard Esc) cancels the
+        # one shared countdown. Construct BEFORE InputRouter so we
+        # can pass it in; ButtonWatcher receives the same instance
+        # later from _start_buttons_best_effort.
+        from minijs8.input.shutdown_gesture import ShutdownGesture
+        self._shutdown_gesture = ShutdownGesture(
+            self._ui_state, loop, systemctl_poweroff,
+        )
+
         # Note: set_frequency callback is supplied later via
         # _wire_router_set_frequency() after the CAT service starts.
         # Construct here so the UI can edit non-frequency fields even
@@ -234,6 +248,7 @@ class MiniJS8App:
             compose_store=self._compose_store_sync,
             allcall_query_msgs=self._allcall_query_msgs_sync,
             allcall_cq=self._allcall_cq_sync,
+            shutdown_gesture=self._shutdown_gesture,
         )
 
         # ── Heartbeat beacon lifecycle ──────────────────────────────
@@ -306,7 +321,8 @@ class MiniJS8App:
         assert self._ui_state is not None
         try:
             self._buttons = ButtonWatcher(
-                self._ui_state, loop, shutdown_callback=systemctl_poweroff,
+                self._ui_state, loop,
+                shutdown_gesture=self._shutdown_gesture,
             )
             self._buttons.start()
         except Exception:

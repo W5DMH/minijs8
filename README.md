@@ -168,7 +168,14 @@ The clean-shutdown countdown.
 
 ![SHUTTING_DOWN](images/screen-shutting-down.png)
 
-Triggered by holding both buttons for ~3 seconds. The Pi runs a graceful systemd shutdown so the SQLite databases close cleanly and the config file flushes. Release before the countdown expires to cancel.
+Two ways to trigger it:
+
+- **Hardware**: hold both PiTFT buttons for 5 seconds. The screen switches as soon as both are pressed; release either button before the countdown ends to cancel.
+- **Keyboard (USB or SSH)**: press **Ctrl-X** from any screen. The 5-second countdown begins immediately. Press **Esc** (or Ctrl-C) to cancel.
+
+Either path runs through the same code, so the experience is identical — the progress bar drains over 5 seconds and then the Pi runs a graceful systemd shutdown, closing the SQLite databases cleanly and flushing the config file. The countdown bar lets you back out if you triggered it by accident.
+
+Ctrl-X works even on an unconfigured station — power-off is a life-cycle gesture, not a TX-gated action, so an operator without a callsign set can still cleanly turn the device off.
 
 ---
 
