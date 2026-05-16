@@ -445,7 +445,7 @@ minijs8/
 ## Credits
 
 - JS8Call protocol by KN4CRD — JS8Call.com
-- gfsk8 modem fork pinned at github.com/W5DMH/gfsk8-modem-clean
+- **gfsk8 modem** by **[jfrancis42/gfsk8-modem-clean](https://github.com/jfrancis42/gfsk8-modem-clean)** — the foundation this whole project rests on. Without his hard work on the JS8 modem implementation, MiniJS8 would not be possible. MiniJS8 uses a pinned fork at [W5DMH/gfsk8-modem-clean](https://github.com/W5DMH/gfsk8-modem-clean) for build reproducibility.
 - gpsd, chrony, SQLite, Pillow, NumPy — upstream projects that make this work
 - WGS84 ECEF→LLA conversion: Bowring 1976 closed-form algorithm
 - Tested on the W5DMH bench, EN83ih
