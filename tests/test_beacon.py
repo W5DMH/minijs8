@@ -224,9 +224,16 @@ def test_emergency_fire_one_enqueues_as_allcall(queue):
     assert "-71.0589" in msg.text
 
 
-def test_emergency_default_interval_is_5_min():
+def test_emergency_default_interval_is_3_min():
+    """Per operator spec (May 2026): emergency beacon TXes every 3 min.
+
+    Originally 5 minutes; the operator picked 3 as the sweet spot for
+    'ample time for a response but not wasting time' (Q2 in the
+    emergency-beacon design conversation). Pin the constant so a
+    refactor doesn't quietly speed it up or slow it down.
+    """
     from minijs8.tx.beacon import EMERGENCY_BEACON_INTERVAL_S
-    assert EMERGENCY_BEACON_INTERVAL_S == 5 * 60
+    assert EMERGENCY_BEACON_INTERVAL_S == 3 * 60
 
 
 # ── Single-shot mode (HbMode.SINGLE backing) ────────────────────────

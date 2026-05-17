@@ -141,12 +141,53 @@ def _draw_header(
     )
 
     # Clock — right-aligned, vertically centered.
-    draw.text(
-        (time_x, time_y),
-        time_str,
-        font=fonts.clock,
-        fill=theme.HEADER_FG,
-    )
+    # When the emergency beacon is armed, replace the UTC clock with
+    # a bold red SOS badge so the operator sees the armed state on
+    # every screen they navigate to. Rationale: an active SOS broadcast
+    # is the single most important piece of state the device can be
+    # in; UTC time is useful but not as immediately critical, and the
+    # operator can always come back to the EMERGENCY screen to see
+    # exact countdown timing. Per spec §6.4 (May 2026): "armed-anywhere
+    # indicator on every screen header".
+    if state.emergency_beacon_armed:
+        sos_text = "SOS"
+        try:
+            sos_w = int(draw.textlength(sos_text, font=fonts.clock))
+            bbox = fonts.clock.getbbox("S")
+            sos_h = bbox[3] - bbox[1]
+        except Exception:
+            sos_w = 32
+            sos_h = theme.FONT_CLOCK
+        # Right-align where the clock was. Add a 2-px border around
+        # the text for badge-like visual weight on the dark header.
+        badge_pad_x = 4
+        badge_pad_y = 2
+        sos_x = theme.SCREEN_W - sos_w - theme.PAD_X - badge_pad_x
+        sos_y = (theme.HEADER_H - sos_h) // 2 - 1
+        # Filled red rectangle behind the text for badge feel.
+        draw.rectangle(
+            [
+                (sos_x - badge_pad_x, sos_y - badge_pad_y),
+                (sos_x + sos_w + badge_pad_x - 1,
+                 sos_y + sos_h + badge_pad_y - 1),
+            ],
+            fill=theme.FG_BAD,
+        )
+        # White text inside the red badge.
+        draw.text(
+            (sos_x, sos_y),
+            sos_text,
+            font=fonts.clock,
+            fill=theme.HEADER_FG,
+        )
+    else:
+        # Normal-state clock.
+        draw.text(
+            (time_x, time_y),
+            time_str,
+            font=fonts.clock,
+            fill=theme.HEADER_FG,
+        )
 
 
 def _format_time_for_header(state: UISnapshot) -> str:
@@ -1586,106 +1627,153 @@ def _render_emergency(state: UISnapshot, fonts: Fonts) -> Image.Image:
     bbox = fonts.large_bold.getbbox(text)
     tw = bbox[2] - bbox[0]
     draw.text(
-        ((theme.SCREEN_W - tw) // 2, theme.BODY_Y0 + 14),
+        ((theme.SCREEN_W - tw) // 2, theme.BODY_Y0 + 6),
         text,
         font=fonts.large_bold,
         fill=theme.FG_BAD,
     )
-    y = theme.BODY_Y0 + 14 + (bbox[3] - bbox[1]) + 16
+    y = theme.BODY_Y0 + 6 + (bbox[3] - bbox[1]) + 8
 
-    # The emergency screen ALWAYS shows the operator's actual position
-    # as lat/lon when a GPS fix is available — not the grid. Rationale:
-    # in a real emergency the most useful data we can hand a rescuer
-    # (or transmit on-air) is exact coordinates. Grid squares
-    # (Maidenhead) are a JS8-convention compact representation but
-    # they introduce 5-15 km ambiguity at FN42-precision and only
-    # come down to ~25 m at FN42aa00 — still less precise than
-    # decimal-degree GPS. We display the raw fix and let the operator
-    # read coordinates over voice to anyone who needs them.
-    if state.emergency_override:
-        # Unconfigured-emergency mode: N0CALL identity, GPS required.
-        draw.text((theme.PAD_X, y), "ID:", font=fonts.body, fill=theme.FG_DIM)
+    # ── Identity ────────────────────────────────────────────────────
+    # ALWAYS show the operator's callsign. Earlier versions only
+    # showed N0CALL when emergency_override was True, but
+    # emergency_override is a one-way flag — once tripped it stays
+    # True even after the operator configures their callsign in
+    # SETUP. The result was that configured stations displayed
+    # "ID: N0CALL (unconfigured)" which is wrong and unhelpful.
+    # Source of truth is now state.callsign:
+    #   - Non-empty → show the actual callsign in red (alerting)
+    #   - Empty → show "N0CALL (unconfigured)" — only true when
+    #     the operator hasn't set a callsign at all.
+    has_callsign = bool(state.callsign and state.callsign != "N0CALL")
+    draw.text((theme.PAD_X, y), "ID:", font=fonts.body, fill=theme.FG_DIM)
+    if has_callsign:
+        draw.text(
+            (theme.PAD_X + 32, y), state.callsign,
+            font=fonts.body, fill=theme.FG_BAD,
+        )
+    else:
         draw.text(
             (theme.PAD_X + 32, y), "N0CALL (unconfigured)",
             font=fonts.body, fill=theme.FG_BAD,
         )
-        y += 24
-        draw.text((theme.PAD_X, y), "Pos:", font=fonts.body, fill=theme.FG_DIM)
-        if state.gps.has_position and state.gps.lat is not None and state.gps.lon is not None:
-            pos = f"{state.gps.lat:+.4f}, {state.gps.lon:+.4f}"
-            draw.text(
-                (theme.PAD_X + 32, y), pos,
-                font=fonts.body_mono, fill=theme.FG_GOOD,
-            )
-            y += 24
-            draw.text(
-                (theme.PAD_X, y),
-                "Beacon: not armed (Step 6)",
-                font=fonts.small, fill=theme.FG_DIM,
-            )
-            _draw_footer(draw, fonts, "TX armed — beacon arming in Step 6")
-        else:
-            draw.text(
-                (theme.PAD_X + 32, y), "no GPS fix yet",
-                font=fonts.body, fill=theme.FG_BAD,
-            )
-            y += 24
-            status_lines = (
-                "Waiting for GPS fix —",
-                "ensure unobstructed",
-                "view of sky!",
-            )
-            for line in status_lines:
-                draw.text(
-                    (theme.PAD_X + 4, y), line,
-                    font=fonts.small, fill=theme.FG_WARN,
-                )
-                y += 14
-            _draw_footer(draw, fonts, "TX blocked until GPS fix arrives")
-    else:
-        # Normal-mode emergency screen: configured station.
-        # Position priority: live GPS lat/lon > configured grid > no
-        # location. Lat/lon is preferred even when a grid is also
-        # configured, because the GPS fix is authoritative for the
-        # operator's CURRENT location and the configured grid may be
-        # stale or wrong (operator moved without updating settings).
+    y += 20
+
+    # ── Position ────────────────────────────────────────────────────
+    # GPS lat/lon is preferred when available — it's the most
+    # actionable thing a rescuer can act on. Fall back to the
+    # configured grid only when no fix is available, mark stale with
+    # "(configured)" so the operator knows it's not live.
+    draw.text((theme.PAD_X, y), "Pos:", font=fonts.body, fill=theme.FG_DIM)
+    if (
+        state.gps.has_position
+        and state.gps.lat is not None
+        and state.gps.lon is not None
+    ):
+        pos = f"{state.gps.lat:+.4f}, {state.gps.lon:+.4f}"
         draw.text(
-            (theme.PAD_X, y), "Position:", font=fonts.body, fill=theme.FG_DIM
+            (theme.PAD_X + 32, y), pos,
+            font=fonts.body_mono, fill=theme.FG_GOOD,
+        )
+    elif state.grid:
+        draw.text(
+            (theme.PAD_X + 32, y), f"{state.grid} (grid)",
+            font=fonts.body, fill=theme.FG,
+        )
+    else:
+        draw.text(
+            (theme.PAD_X + 32, y), "no position",
+            font=fonts.body, fill=theme.FG_BAD,
+        )
+    y += 24
+
+    # ── Three visual states ─────────────────────────────────────────
+    # 1) HOLDING (in-progress arm or disarm): progress bar + label
+    # 2) ARMED (idle, beacon TXing): "Beacon: ARMED" red text
+    # 3) IDLE: "Beacon: not armed" dim text
+    hold_in_progress = (
+        state.emergency_hold_progress is not None
+        and state.emergency_hold_direction is not None
+    )
+
+    if hold_in_progress:
+        # Progress bar — 3-second countdown drains from full to empty.
+        direction = state.emergency_hold_direction
+        label = "Arming…" if direction == "arm" else "Disarming…"
+        draw.text(
+            (theme.PAD_X, y), label,
+            font=fonts.body, fill=theme.FG_BAD,
+        )
+        y += 18
+        # Bar background (dim) and fill (red while arming, dim-grey
+        # while disarming — visual distinction matches the action).
+        bar_x0 = theme.PAD_X
+        bar_x1 = theme.SCREEN_W - theme.PAD_X
+        bar_y0 = y
+        bar_h = 12
+        bar_y1 = bar_y0 + bar_h
+        draw.rectangle(
+            [(bar_x0, bar_y0), (bar_x1, bar_y1)],
+            outline=theme.FG_DIM,
+        )
+        progress_w = int(
+            (bar_x1 - bar_x0 - 2)
+            * max(0.0, min(1.0, state.emergency_hold_progress or 0.0))
+        )
+        bar_fill = theme.FG_BAD if direction == "arm" else theme.FG_DIM
+        draw.rectangle(
+            [
+                (bar_x0 + 1, bar_y0 + 1),
+                (bar_x0 + 1 + progress_w, bar_y1 - 1),
+            ],
+            fill=bar_fill,
+        )
+        y += bar_h + 4
+        # Footer — cancel hint.
+        if direction == "arm":
+            _draw_footer(draw, fonts, "Hold ENTER 3 s · ESC cancels")
+        else:
+            _draw_footer(draw, fonts, "Hold ESC 3 s · ENTER cancels")
+    elif state.emergency_beacon_armed:
+        # Armed state — clear, attention-grabbing red.
+        draw.text(
+            (theme.PAD_X, y), "Beacon:",
+            font=fonts.body, fill=theme.FG_DIM,
+        )
+        draw.text(
+            (theme.PAD_X + 70, y), "ARMED",
+            font=fonts.body, fill=theme.FG_BAD,
         )
         y += 20
-        if state.gps.has_position and state.gps.lat is not None and state.gps.lon is not None:
-            pos = f"{state.gps.lat:+.4f}, {state.gps.lon:+.4f}"
+        # Sub-text: what's happening on the air.
+        draw.text(
+            (theme.PAD_X, y), "TX SOS every 3 min",
+            font=fonts.small, fill=theme.FG_DIM,
+        )
+        _draw_footer(draw, fonts, "Hold ESC 3 s to disarm")
+    else:
+        # Idle state — beacon not armed.
+        if has_callsign or state.emergency_override:
+            # Configured station OR emergency-bypass mode — can arm.
             draw.text(
-                (theme.PAD_X + 8, y), pos,
-                font=fonts.body_mono, fill=theme.FG_GOOD,
-            )
-            y += 20
-            draw.text(
-                (theme.PAD_X + 8, y), "(GPS)",
+                (theme.PAD_X, y), "Beacon: not armed",
                 font=fonts.small, fill=theme.FG_DIM,
             )
-        elif state.grid:
-            # Fall back to configured grid only when no GPS fix is
-            # available. Mark it as configured so the operator knows
-            # the position isn't live.
-            grid_str = f"{state.grid} (configured)"
-            draw.text(
-                (theme.PAD_X + 8, y), grid_str,
-                font=fonts.body, fill=theme.FG,
-            )
+            _draw_footer(draw, fonts, "Hold ENTER 3 s to arm")
         else:
+            # Unconfigured AND no emergency-bypass — operator must
+            # bypass before the gesture will succeed. Tell them what
+            # to do rather than letting them hammer ENTER fruitlessly.
             draw.text(
-                (theme.PAD_X + 8, y), "no position",
-                font=fonts.body, fill=theme.FG_BAD,
+                (theme.PAD_X, y), "Configure callsign in SETUP",
+                font=fonts.small, fill=theme.FG_WARN,
             )
-        y += 24
-        draw.text(
-            (theme.PAD_X, y),
-            "Beacon: not armed",
-            font=fonts.small,
-            fill=theme.FG_DIM,
-        )
-        _draw_footer(draw, fonts, "ARM: hold ENTER 3 s (Step 6)")
+            y += 14
+            draw.text(
+                (theme.PAD_X, y), "or use Emergency Bypass",
+                font=fonts.small, fill=theme.FG_WARN,
+            )
+            _draw_footer(draw, fonts, "TX blocked: no callsign")
     return img
 
 

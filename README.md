@@ -2,7 +2,7 @@
 
 A standalone JS8Call transceiver application for the Raspberry Pi Zero 2W. JS8 protocol over HF, with a 240×240 display, two-button navigation, GPS, and an SQLite-backed mailbox — no laptop required.
 
-**Version:** 1.0.0 · **Platform:** Raspberry Pi Zero 2W (Pi OS Bookworm) · **License:** Proprietary
+**Version:** 1.1.0 · **Platform:** Raspberry Pi Zero 2W (Pi OS Bookworm) · **License:** Proprietary
 
 ![SETUP V1.0 screen showing the configured station](images/screen-setup.png)
 
@@ -148,11 +148,19 @@ After picking a target callsign from the Heard list (Step 3 of the spec), you ca
 
 ### EMERGENCY
 
-Operator-triggered SOS mode.
+Operator-triggered SOS beacon.
 
 ![EMERGENCY](images/screen-emergency.png)
 
-Hold ENTER for 3 seconds to arm. Armed mode transmits `@ALLCALL SOS <lat> <lon>` repeatedly with a randomised slot delay, using your live GPS position when available (or your configured grid as fallback). Designed for life-safety situations — works even on an unconfigured station via Setup's emergency bypass option. The button-hold timer prevents accidental activation.
+The screen shows your callsign as `ID:` and your current position — live GPS lat/lon when available, your configured grid as fallback. The bottom row tells you what the beacon is doing.
+
+**To arm the beacon**: press and hold ENTER for 3 seconds. A progress bar drains as you hold; press ESC at any time to cancel. When the countdown completes the beacon transmits `<call>: @ALLCALL SOS <lat> <lon>` immediately and then every **3 minutes** thereafter on a randomised slot offset.
+
+**While armed**, a red **SOS** badge appears in the header of **every screen** so you can't miss that the beacon is active. The beacon continues transmitting in the background — you can navigate to INBOX or HEARD to see responses from stations that copied your SOS, or check HOME for GPS state, without interrupting the broadcast.
+
+**To disarm the beacon**: return to the EMERGENCY screen and hold ESC for 3 seconds. A progress bar drains the same way; press ENTER to cancel the disarm if you change your mind. Once the countdown completes the beacon stops, the SOS badge clears from every screen header, and the device returns to normal.
+
+The 3-second hold both directions is deliberate friction — accidental keystrokes don't broadcast or silence a real distress call. EMERGENCY works even on a station that hasn't been configured with a callsign (the "Emergency Bypass" toggle in Setup unlocks the gesture); in that case the beacon TXes as `N0CALL` with your GPS coordinates, which is still actionable to anyone copying it.
 
 ### SETUP
 
@@ -213,9 +221,9 @@ When a group you're a member of receives a `SNR?` or `GRID?` query, MiniJS8 auto
 
 A USB GPS dongle plugged into the Pi feeds the application via `gpsd`. The HOME screen shows fix state and satellite count; the EMERGENCY screen shows your decimal-degree position; the GPS-derived grid appears in parentheses on the HOME `Grid` row when present. MiniJS8 includes a workaround for a known `gpsd 3.22 + u-blox 7 PROTVER 14.00` bug where TPV records report `lat=0, lon=0` despite the receiver computing valid ECEF coordinates — when this condition is detected the application converts ECEF to lat/lon itself using the Bowring 1976 closed-form algorithm, accurate to within a few metres.
 
-### Emergency mode
+### Emergency beacon
 
-Hold ENTER on the EMERGENCY screen for 3 seconds to arm an SOS broadcast. Once armed, the station transmits `@ALLCALL SOS <lat> <lon>` with a randomised slot delay, using live GPS coordinates when available or your configured grid as fallback. Emergency mode works even on a station that hasn't been configured with a callsign (the "emergency bypass" toggle in Setup unlocks TX for SOS only). The button-hold timer and explicit screen prevent accidental activation.
+Hold ENTER for 3 seconds on the EMERGENCY screen to arm the SOS beacon. Once armed, the station transmits `<call>: @ALLCALL SOS <lat> <lon>` immediately and every 3 minutes thereafter on a randomised slot offset, preferring live GPS coordinates over the configured grid. A red **SOS** badge appears in the header of every screen while armed, so the operator can navigate to INBOX or HEARD to see responses without losing the indicator. Hold ESC for 3 seconds on the EMERGENCY screen to disarm. The 3-second hold in both directions prevents accidental activation or silencing. Emergency mode also works on unconfigured stations via the "Emergency Bypass" toggle in Setup — the beacon then transmits as `N0CALL` with GPS coordinates, still actionable to receivers.
 
 ### Radio control (CAT)
 

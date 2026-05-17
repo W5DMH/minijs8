@@ -42,7 +42,7 @@ HEARTBEAT_INTERVAL_S = 30 * 60       # 30 minutes
 HEARTBEAT_RANDOM_OFFSET_S = 60
 
 # Emergency beacon config.
-EMERGENCY_BEACON_INTERVAL_S = 5 * 60  # 5 minutes
+EMERGENCY_BEACON_INTERVAL_S = 3 * 60  # 3 minutes — operator-spec May 2026
 
 
 class _BaseBeacon(threading.Thread):
@@ -281,4 +281,4 @@ class EmergencyBeacon(_BaseBeacon):
         # All-call format: "<call>: @ALLCALL SOS <pos>"
         # SOS is internationally recognized; in JS8 community usage
         # this is the convention for genuine emergency traffic.
-        return f"{ident}: @ALLCALL SOS {pos}"
+        return f"{ident}: @ALLCALL SOS SEND HELP {pos}"

@@ -437,3 +437,156 @@ def test_enqueue_depth_includes_encoding_rows(queue):
     # Same for legacy enqueue path.
     overflow2 = queue.enqueue("OVERFLOW", OutboundKind.ALLCALL)
     assert overflow2 is None
+
+
+# ── Stale-broadcast purge (May 2026 W5DMH bench fix) ─────────────────
+
+
+def test_purge_stale_broadcasts_drops_allcall_rows(queue):
+    """ALLCALL rows (SOS, CQ, QUERY MSGS — operator-initiated
+    broadcasts) in unsent states must be deleted on startup recovery.
+    Critical safety: a stale SOS from a previous run must NEVER
+    auto-resume after a reboot.
+    """
+    sos_id = queue.enqueue(
+        "W5DMH: @ALLCALL SOS +43.2794 -83.3391",
+        OutboundKind.ALLCALL,
+    )
+    assert sos_id is not None
+
+    deleted = queue.purge_stale_broadcasts()
+
+    assert deleted == {OutboundKind.ALLCALL.value: 1}
+    # The row should be gone from the DB entirely.
+    assert queue.get(sos_id) is None
+
+
+def test_purge_stale_broadcasts_drops_heartbeat_rows(queue):
+    """HEARTBEAT rows in unsent states are deleted on startup. The
+    HeartbeatBeacon thread will queue a fresh one within its interval
+    if the operator had HBMode enabled — the stale one is redundant
+    and would otherwise be re-encoded for no reason."""
+    hb_id = queue.enqueue(
+        "W5DMH: @HB HEARTBEAT EN83ih",
+        OutboundKind.HEARTBEAT,
+    )
+    assert hb_id is not None
+
+    deleted = queue.purge_stale_broadcasts()
+
+    assert deleted == {OutboundKind.HEARTBEAT.value: 1}
+    assert queue.get(hb_id) is None
+
+
+def test_purge_stale_broadcasts_preserves_directed(queue):
+    """Regression: personal directed messages must NOT be deleted by
+    the broadcast purge — "I was about to reply to K1ABC and got
+    rebooted" is recoverable intent. Only broadcasts get purged."""
+    directed_id = queue.enqueue(
+        "K1ABC: hello", OutboundKind.DIRECTED, to_call="K1ABC",
+    )
+    reply_id = queue.enqueue(
+        "K1ABC: SNR -9", OutboundKind.REPLY,
+    )
+    assert directed_id is not None
+    assert reply_id is not None
+
+    deleted = queue.purge_stale_broadcasts()
+
+    # No broadcasts existed, so the purge is a no-op.
+    assert deleted == {}
+    # Personal messages survive
+    assert queue.get(directed_id) is not None
+    assert queue.get(reply_id) is not None
+
+
+def test_purge_stale_broadcasts_preserves_delivered_history(queue):
+    """Already-DELIVERED broadcast rows are kept — they're history,
+    not pending work. The purge only affects unsent states.
+    """
+    sos_id = queue.enqueue(
+        "W5DMH: @ALLCALL SOS +43.2794 -83.3391",
+        OutboundKind.ALLCALL,
+    )
+    assert sos_id is not None
+    # Simulate the row reached DELIVERED in a previous run.
+    queue.mark_delivered(sos_id)
+
+    deleted = queue.purge_stale_broadcasts()
+
+    assert deleted == {}, (
+        "DELIVERED rows are history; purge must not touch them"
+    )
+    row = queue.get(sos_id)
+    assert row is not None
+    assert row.state == OutboundState.DELIVERED
+
+
+def test_purge_stale_broadcasts_handles_mixed_states(queue):
+    """A single ALLCALL row can be in ENCODING, QUEUED, SENDING, or
+    WAIT_ACK at restart time. All non-terminal states must be purged.
+    We exercise three states here (queue depth cap is 3 in this
+    fixture); the SENDING state path is symmetric with the others
+    in the SQL."""
+    # Row 0: ENCODING (default at enqueue)
+    id0 = queue.enqueue("W5DMH: @ALLCALL SOS msg0", OutboundKind.ALLCALL)
+    # Row 1: QUEUED
+    id1 = queue.enqueue("W5DMH: @ALLCALL SOS msg1", OutboundKind.ALLCALL)
+    queue.mark_encoded(id1)
+    # Row 2: WAIT_ACK
+    id2 = queue.enqueue("W5DMH: @ALLCALL SOS msg2", OutboundKind.ALLCALL)
+    queue.mark_encoded(id2)
+    queue.mark_sending(id2)
+    queue.mark_wait_ack(id2)
+
+    deleted = queue.purge_stale_broadcasts()
+
+    assert deleted.get(OutboundKind.ALLCALL.value) == 3
+    for rid in (id0, id1, id2):
+        assert queue.get(rid) is None, (
+            f"row {rid} should be deleted regardless of its unsent state"
+        )
+
+
+def test_purge_stale_broadcasts_returns_per_kind_counts(queue):
+    """Return value reports counts per kind so the app can log
+    what was dropped. Empty dict if nothing purged."""
+    queue.enqueue("a", OutboundKind.ALLCALL)
+    queue.enqueue("b", OutboundKind.ALLCALL)
+    queue.enqueue("c", OutboundKind.HEARTBEAT)
+
+    deleted = queue.purge_stale_broadcasts()
+
+    assert deleted == {
+        OutboundKind.ALLCALL.value: 2,
+        OutboundKind.HEARTBEAT.value: 1,
+    }
+
+
+def test_purge_stale_broadcasts_empty_queue_is_safe(queue):
+    """No rows → no-op. Common case on a clean install."""
+    deleted = queue.purge_stale_broadcasts()
+    assert deleted == {}
+
+
+def test_purge_before_reset_recovers_directed_only(queue):
+    """Integration: the recovery pattern in app.py runs purge BEFORE
+    reset. Verify the combined effect — broadcasts are deleted,
+    directed rows survive and get reset to ENCODING.
+    """
+    sos_id = queue.enqueue("W5DMH: @ALLCALL SOS msg", OutboundKind.ALLCALL)
+    directed_id = queue.enqueue("K1ABC: hello", OutboundKind.DIRECTED, to_call="K1ABC")
+    # Push directed to QUEUED to simulate a pre-restart state
+    queue.mark_encoded(directed_id)
+
+    # The two-step recovery pattern from app.py
+    purged = queue.purge_stale_broadcasts()
+    reset = queue.reset_unencoded_to_encoding()
+
+    assert purged == {OutboundKind.ALLCALL.value: 1}
+    assert queue.get(sos_id) is None, "stale SOS must be deleted"
+    # Directed row survives and is back to ENCODING for re-render
+    row = queue.get(directed_id)
+    assert row is not None
+    assert row.state == OutboundState.ENCODING
+    assert reset >= 1

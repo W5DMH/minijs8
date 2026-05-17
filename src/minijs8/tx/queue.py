@@ -455,6 +455,14 @@ class OutboundQueue:
 
         Called once during app startup, BEFORE the encode worker or
         scheduler start. Returns the count of rows reset (for logging).
+
+        Important: ``purge_stale_broadcasts()`` should be called
+        BEFORE this method on startup. That way, broadcast-kind rows
+        (SOS, HEARTBEAT, CQ, ALLCALL — all time-critical and operator-
+        initiated) are deleted entirely instead of being resurrected.
+        Without that ordering, a stale SOS from a crashed previous run
+        would be re-encoded and TX'd, which is dangerous behaviour for
+        any life-critical broadcast.
         """
         cur = self._conn.execute(
             "UPDATE outbound SET state=? "
@@ -466,6 +474,66 @@ class OutboundQueue:
             ),
         )
         return cur.rowcount
+
+    def purge_stale_broadcasts(self) -> dict[str, int]:
+        """Delete unsent broadcast-kind rows at startup recovery time.
+
+        Returns a dict mapping ``OutboundKind`` value → count deleted,
+        for logging. Empty dict if nothing was purged.
+
+        Rationale
+        ---------
+        The outbound queue is a SQLite store that survives daemon
+        restarts. Personal directed messages (kind=DIRECTED, REPLY)
+        SHOULD survive a restart — "I was about to reply to K1ABC and
+        got rebooted" is recoverable intent. But **broadcast** kinds
+        are time-critical and tied to the operator's current state:
+
+          - ``ALLCALL`` includes SOS, CQ, and QUERY MSGS. An SOS from
+            a crashed previous run must NEVER auto-resume — the
+            operator's situation may have changed; in the worst case
+            the device could keep beaconing emergency traffic after
+            the operator is fine. CQ has no meaning across restarts
+            either — by the time the operator is back online, the
+            propagation window or call intent may be gone.
+          - ``HEARTBEAT`` rows are produced by the HeartbeatBeacon
+            thread on its own schedule. If the operator had HBMode
+            enabled, a fresh heartbeat will be queued by the beacon
+            within minutes of restart — the stale one is redundant.
+
+        Discovered the hard way (W5DMH bench, May 2026): a stale SOS
+        from a previous deployment survived in messages.db, was
+        re-encoded on every reboot, and the malformed wire ("SEND
+        HELP" tokens that don't parse as JS8 grammar) caused the
+        encoder to retry indefinitely, saturating both CPU cores on
+        the Pi Zero 2W and making the UI unresponsive. The fix is
+        to delete broadcasts at startup BEFORE the encoder sees them.
+
+        We delete unconditionally for any unsent state (ENCODING,
+        QUEUED, SENDING). Already-DELIVERED rows are kept for the
+        outgoing-message log. WAIT_ACK doesn't apply to broadcasts
+        (no single station's ACK closes a broadcast).
+        """
+        deleted: dict[str, int] = {}
+        broadcast_kinds = (
+            OutboundKind.ALLCALL.value,
+            OutboundKind.HEARTBEAT.value,
+        )
+        unsent_states = (
+            OutboundState.ENCODING.value,
+            OutboundState.QUEUED.value,
+            OutboundState.SENDING.value,
+            OutboundState.WAIT_ACK.value,
+        )
+        for kind in broadcast_kinds:
+            cur = self._conn.execute(
+                "DELETE FROM outbound "
+                f"WHERE kind=? AND state IN ({','.join(['?'] * len(unsent_states))})",
+                (kind, *unsent_states),
+            )
+            if cur.rowcount > 0:
+                deleted[kind] = cur.rowcount
+        return deleted
 
     def mark_sending(self, message_id: int) -> None:
         """Transition QUEUED → SENDING. Increments attempts."""

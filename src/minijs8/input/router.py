@@ -31,6 +31,7 @@ from minijs8.ui.state import ComposeCmd, Screen, UIState
 
 if TYPE_CHECKING:
     from minijs8.input.shutdown_gesture import ShutdownGesture
+    from minijs8.input.emergency_arm_gesture import EmergencyArmGesture
 
 _log = logging.getLogger(__name__)
 
@@ -78,6 +79,7 @@ class InputRouter:
         allcall_query_msgs: Optional[Callable[[], bool]] = None,
         allcall_cq: Optional[Callable[[], bool]] = None,
         shutdown_gesture: Optional["ShutdownGesture"] = None,
+        emergency_arm_gesture: Optional["EmergencyArmGesture"] = None,
     ) -> None:
         self._ui = ui
         # save_config(callsign, grid, units, new_groups=None) -> True
@@ -143,6 +145,11 @@ class InputRouter:
         # don't exercise the shutdown path can omit it; the Ctrl-X
         # hotkey is a quiet no-op when not provided.
         self._shutdown_gesture = shutdown_gesture
+        # emergency_arm_gesture owns the 3-second arm/disarm hold for
+        # the SOS beacon. Optional so tests that don't exercise the
+        # emergency flow can omit it; ENTER/ESC on the EMERGENCY
+        # screen are quiet no-ops when not provided.
+        self._emergency_arm_gesture = emergency_arm_gesture
 
     def handle(self, event: KeyEvent) -> None:
         """Top-level dispatcher. Wraps any handler exception so a
@@ -469,6 +476,28 @@ class InputRouter:
                 return
             # Any other key: ignore.
             return
+
+        # EMERGENCY screen — arm/disarm beacon via 3-second hold gestures.
+        #
+        # State machine:
+        #   IDLE                ENTER  → begin_arming (3-second countdown)
+        #   IDLE                Other  → fall through to ring nav
+        #   ARMING (hold)       ESC    → cancel hold
+        #   ARMING (hold)       Other  → ignored (avoid accidental cancel)
+        #   ARMED               ESC    → begin_disarming (3-second countdown)
+        #   ARMED               Other  → fall through to ring nav (operator
+        #                                can browse INBOX/HEARD while beacon
+        #                                continues TXing in the background)
+        #   DISARMING (hold)    ENTER  → cancel hold
+        #   DISARMING (hold)    Other  → ignored
+        #
+        # Ring nav from ARMED is intentional: per the May 2026 spec, the
+        # operator should be able to see responses on other screens while
+        # the beacon transmits. The SOS badge in every screen header
+        # keeps them aware that the beacon is active.
+        if snapshot.screen is Screen.EMERGENCY:
+            if self._handle_emergency_key(event, snapshot):
+                return
 
         # Ring nav with ← / → (locked when unconfigured).
         if event.key is Key.LEFT:
@@ -884,3 +913,80 @@ class InputRouter:
             self._ui.close_hb_mode_select(commit=False)
             return True
         return False
+
+    def _handle_emergency_key(
+        self, event: KeyEvent, snapshot,
+    ) -> bool:
+        """EMERGENCY screen — arm/disarm via 3-second hold gestures.
+
+        Returns True if the key was consumed; False if it should fall
+        through to ring nav (left/right cycle to other screens).
+
+        The state machine has four states:
+          1. IDLE (not armed, no hold)
+          2. ARMING (3-second arm hold in progress)
+          3. ARMED (beacon TXing)
+          4. DISARMING (3-second disarm hold in progress)
+
+        Transitions:
+          IDLE  + ENTER → begin_arming
+          ARMING + ESC → cancel hold (back to IDLE)
+          ARMING + other → ignored
+          ARMED + ESC → begin_disarming
+          ARMED + non-Esc nav keys → fall through to ring nav
+          DISARMING + ENTER → cancel hold (back to ARMED)
+          DISARMING + other → ignored
+
+        Returning False allows the operator to navigate away from
+        EMERGENCY while ARMED — the beacon continues to TX from its
+        background thread, and the SOS badge in every screen header
+        keeps the armed state visible.
+        """
+        if self._emergency_arm_gesture is None:
+            # No gesture wired — quiet no-op so test fixtures that
+            # don't exercise this path don't crash.
+            return False
+
+        gesture = self._emergency_arm_gesture
+        is_holding = gesture.is_active()
+        is_armed = snapshot.emergency_beacon_armed
+
+        # ── During a hold: handle cancel, ignore everything else ────
+        if is_holding:
+            if gesture.is_arming():
+                # Arming → ESC cancels.
+                if event.key is Key.ESC:
+                    gesture.cancel(source="keyboard ESC")
+                    return True
+            else:
+                # Disarming → ENTER cancels (since ESC started it,
+                # we'd loop on ESC; ENTER is the "go back" key here).
+                if event.key is Key.ENTER:
+                    gesture.cancel(source="keyboard ENTER")
+                    return True
+            # Any other key during a hold: ignored. This prevents
+            # accidental cancel via stray keypresses but also blocks
+            # ring nav — operator must complete or cancel the hold
+            # before navigating.
+            return True
+
+        # ── No hold in progress: handle ENTER / ESC ─────────────────
+        if not is_armed:
+            # IDLE state.
+            if event.key is Key.ENTER:
+                gesture.begin_arming(source="keyboard ENTER")
+                return True
+            # ESC on idle — let it bubble. Esc usually means "back"
+            # but EMERGENCY has nothing to back out of. Falling
+            # through to ring nav is harmless (ring nav doesn't
+            # consume Esc either, so this is effectively a no-op).
+            return False
+        else:
+            # ARMED state — beacon is running.
+            if event.key is Key.ESC:
+                gesture.begin_disarming(source="keyboard ESC")
+                return True
+            # Other keys (LEFT/RIGHT for ring nav, ENTER, etc.):
+            # fall through. Operator can navigate to INBOX/HEARD
+            # while the beacon keeps transmitting.
+            return False
